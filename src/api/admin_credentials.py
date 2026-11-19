@@ -672,6 +672,30 @@ def create_router(services: Services) -> APIRouter:
                               detail=f"pinned={pin!r}")
         return {"ok": True}
 
+    @router.delete("/api/credentials/provider/{provider_id}")
+    async def delete_provider_credentials(provider_id: str,
+                                          _csrf: None = Depends(csrf_protected),
+                                          principal=Depends(principal_from_request)):
+        """删除某渠道的全部账号（渠道级批量删除）。
+
+        刻意不复用 `POST /api/credentials/batch` 的 `delete` 动作：删除是唯一
+        不可撤销的批量操作，需要独立的二次确认流。这里仍要求 operator + CSRF，
+        并落一条 `credential.delete` 汇总审计。
+
+        渠道 id 必须在 registry 里：拼错渠道名时返回 400，而不是静默回
+        `deleted: 0`——否则管理员会以为「已清空」，实际只是写错了渠道。
+        """
+        require_operator(principal)
+        if provider_id not in registry:
+            raise InvalidRequest(f"unknown provider {provider_id!r}")
+        deleted = credentials.delete_provider(provider_id)
+        logger.info("管理员 %s 清空渠道 %s：删除 %d 条凭证",
+                    principal.username, provider_id, deleted)
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_DELETE,
+                              target=None,
+                              detail=f"渠道 {provider_id}：删除 {deleted} 条")
+        return {"provider": provider_id, "deleted": deleted}
+
     @router.delete("/api/credentials/{credential_id}")
     async def delete_credential(credential_id: str,
                                 _csrf: None = Depends(csrf_protected),

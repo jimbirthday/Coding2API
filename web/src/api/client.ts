@@ -333,6 +333,12 @@ export const api = {
     request<{ ok: boolean }>("/api/credentials/pin", { method: "POST", ...json({ credential_id: id }) }),
   deleteCredential: (id: string) =>
     request<{ ok: boolean }>(`/api/credentials/${id}`, { method: "DELETE" }),
+  /** 清空某渠道的全部账号（渠道级删除，需二次确认）。 */
+  deleteProviderCredentials: (provider: string) =>
+    request<{ provider: string; deleted: number }>(
+      `/api/credentials/provider/${encodeURIComponent(provider)}`,
+      { method: "DELETE" },
+    ),
   probeCredential: (id: string) =>
     request<ProbeResult>(`/api/credentials/${id}/probe`, { method: "POST" }),
   /** 设置 / 清除凭证限额护栏（整体替换；全关时后端删行）。 */

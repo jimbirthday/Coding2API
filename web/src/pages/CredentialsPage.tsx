@@ -364,6 +364,8 @@ export function CredentialsPage() {
   const client = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // 渠道级二次确认：删除整个渠道不可撤销，先进入确认态，再发请求。
+  const [confirmClearProvider, setConfirmClearProvider] = useState<string | null>(null);
   // 添加凭证对话框（登录渠道 / JSON 导入 / 免费层补回都收在里面）
   // `?new=1`：首启向导的深链，进来直接开新增对话框，随后把参数清掉
   const [searchParams, setSearchParams] = useSearchParams();
@@ -593,6 +595,44 @@ export function CredentialsPage() {
       await refresh();
     } catch (caught) {
       showError(caught instanceof Error ? caught.message : "批量操作失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * 清空某渠道的全部账号。
+   *
+   * 与行内单条删除分开：这是渠道级批量动作，确认文案要给出**该渠道实际账号数**
+   * （`credentials` 全量，而不是当前筛选后的 `group.items`），否则筛选状态下
+   * 用户会以为只会删屏幕上这几条。成功后同步清理选中集合与展开态，避免刷新前
+   * 出现「已删除但仍被勾选」的残影。
+   */
+  const clearProvider = async (provider: string, label: string) => {
+    setBusy(true);
+    try {
+      const result = await api.deleteProviderCredentials(provider);
+      const providerIds = new Set(
+        credentials.filter((credential) => credential.provider === provider)
+          .map((credential) => credential.id),
+      );
+      setSelected((previous) => {
+        const next = new Set(previous);
+        for (const id of providerIds) next.delete(id);
+        return next;
+      });
+      setExpanded((previous) => {
+        const next = new Set(previous);
+        next.delete(provider);
+        return next;
+      });
+      setConfirmClearProvider(null);
+      showNotice(result.deleted > 0
+        ? `已清空「${label}」：删除 ${result.deleted} 个账号。`
+        : `「${label}」已没有账号。`);
+      await refresh();
+    } catch (caught) {
+      showError(caught instanceof Error ? caught.message : "清空渠道失败");
     } finally {
       setBusy(false);
     }
@@ -1055,6 +1095,11 @@ export function CredentialsPage() {
                     // （组内全部行）而不是 filtered，因为组头「全选本渠道」的语义
                     // 就是这一渠道下的所有账号。
                     const groupIds = group.items.map((item) => item.id);
+                    // 渠道级删除的确认数量用**全量**凭证，而不是筛选后的 group.items：
+                    // 清空渠道会删掉所有账号（含当前筛选隐藏的），确认文案必须说全。
+                    const providerTotal = credentials.filter(
+                      (item) => item.provider === group.provider,
+                    ).length;
                     const allSelected = groupIds.length > 0
                       && groupIds.every((id) => selected.has(id));
                     // 本组渠道当前能提供的模型（组头「模型 N 个」+ hover 清单）。
@@ -1393,6 +1438,43 @@ export function CredentialsPage() {
                                     </span>
                                   </button>
                                 </LongTextTip>
+                              )}
+                              {canWrite && (
+                                confirmClearProvider === group.provider ? (
+                                  <span className="flex shrink-0 items-center gap-1 pl-2">
+                                    <Button
+                                      size="sm"
+                                      variant="danger"
+                                      disabled={busy}
+                                      data-testid={`clear-provider-confirm-${group.key}`}
+                                      onClick={() => void clearProvider(group.provider, group.label)}
+                                    >
+                                      确认删除 {providerTotal} 个
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      disabled={busy}
+                                      data-testid={`clear-provider-cancel-${group.key}`}
+                                      onClick={() => setConfirmClearProvider(null)}
+                                    >
+                                      取消
+                                    </Button>
+                                  </span>
+                                ) : (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    disabled={busy}
+                                    className="ml-2 shrink-0 text-danger-ink"
+                                    title={`删除「${group.label}」的全部 ${providerTotal} 个账号（不受当前筛选影响）`}
+                                    aria-label={`清空 ${group.label} 渠道`}
+                                    data-testid={`clear-provider-${group.key}`}
+                                    onClick={() => setConfirmClearProvider(group.provider)}
+                                  >
+                                    <Trash2 className="size-3.5" /> 清空
+                                  </Button>
+                                )
                               )}
                             </span>
                             </div>

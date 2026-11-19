@@ -1091,7 +1091,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/users
 - **Responses / Anthropic 出口只做各自客户端子集**（细节见 §3.7、§3.8）：不做 `store=true` / `previous_response_id`；不发 `[DONE]`；**未经真实 Codex CLI 端到端验证**。
 - **内容风控指纹清洗只改出站副本**：客户端历史不受影响（§3.2）。
 - **统计、成本、日志三条口径**（细节见 §9.7、§13.5）：统计以 `usage_hourly` 为准，代价是最近 ≤5 分钟未进汇总的不计入；成本是下限（匹配不到或未上报输入 token 不计，`null` 显示 `—`，不拿 0 冒充免费）；应用日志只写 stderr（自己写文件会与平台轮转争抢，容器里还会写进镜像层）。
-- **批量运维只收「已有单条端点」的动作**：`probe` / `toggle` / `checkin` / `revive`。`refresh` 无单条入口且强刷白耗一次性票据；`delete` 破坏性太强需二次确认。批量与单条共用实现（`probe_credential_once` / `checkin_credential_once`）；`toggle` 传显式 `enabled` 而非各自取反（混选时取反会让一半号走向相反方向）。
+- **批量运维只收「已有单条端点」的动作**：`probe` / `toggle` / `checkin` / `revive`。`refresh` 无单条入口且强刷白耗一次性票据；`delete` 破坏性太强需二次确认，故渠道级删除另走专用 `DELETE /api/credentials/provider/{provider}`（一次事务删全渠道 + 清模型冷却，管理台组头二次确认，落一条汇总审计）。批量与单条共用实现（`probe_credential_once` / `checkin_credential_once`）；`toggle` 传显式 `enabled` 而非各自取反（混选时取反会让一半号走向相反方向）。
 - **批量审计只记一条汇总**（`toggle` / `revive`）：50 个号是一次操作、一个意图；`probe` / `checkin` 只读、不写审计。
 - **批量 `probe` / `checkin` 用信号量限制在途**（`BATCH_CONCURRENCY=4`），不复用后台 Pacer：全串行会让 50 个号等几分钟。`toggle` / `revive` 是本地 DB 写，不受限。
 - **窄屏表格卡片化改样式不改 DOM**：`<768px` 一行 = 一张卡；不做「按视口渲染两套 JSX」（页面测试按 testid 断言，DOM 一变换语义就没了）。字段名走 `TableCell label` → `data-label` + CSS `::before`。`display:block` 会让 Chromium/WebKit 丢隐式表格语义 → 卡片模式由 `TableCardsContext` 补显式 `role`；不开卡片模式的表格不加 `role`。断点对齐 Tailwind `md`（`767.98px`）。

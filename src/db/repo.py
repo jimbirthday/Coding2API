@@ -284,6 +284,23 @@ class CredentialRepository:
             _clear_model_cooldowns(conn, credential_id)
         return cursor.rowcount > 0
 
+    def delete_provider(self, provider: str) -> int:
+        """删除某渠道的全部凭证，返回删除条数（0 = 该渠道本来就没有账号）。
+
+        与单条删除同一事务：先取 id 再删凭证、清模型级冷却，避免「凭证已删、
+        冷却还留着」的半完成状态。按渠道整批删是操作员的明确意图，调用方
+        必须自己在入口做二次确认；仓储层不再要求逐 id 调用，否则中间失败会
+        留下删了一半的渠道。
+        """
+        with self._db.transaction() as conn:
+            ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM credentials WHERE provider = ?", (provider,))]
+            if ids:
+                conn.execute("DELETE FROM credentials WHERE provider = ?", (provider,))
+                for credential_id in ids:
+                    _clear_model_cooldowns(conn, credential_id)
+        return len(ids)
+
     def set_enabled(self, credential_id: str, enabled: bool) -> bool:
         with self._db.transaction() as conn:
             cursor = conn.execute(

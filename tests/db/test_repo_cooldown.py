@@ -145,6 +145,32 @@ def test_repo_revive_and_delete_clear_model_cooldowns(repo):
     assert db.connect().execute(
         "SELECT COUNT(*) AS c FROM credential_model_cooldowns").fetchone()["c"] == 0
 
+
+def test_repo_delete_provider_removes_only_that_provider_and_cooldowns(repo):
+    """渠道级删除：只删目标渠道，连带清模型冷却；空渠道删除返回 0。"""
+    from src.engine.scheduler import ModelCooldown
+
+    credentials, db = repo
+    first = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t1"})
+    second = credentials.add(provider="codebuddy", credential_data={"bearer_token": "t2"})
+    other = credentials.add(provider="trae", credential_data={"accessToken": "t3"})
+    for credential_id in (first, second, other):
+        credentials.save_error(credential_id, ErrorOutcome(model_cooldowns={
+            "m": ModelCooldown(cooling_until=9999, hits=1)}))
+
+    assert credentials.delete_provider("codebuddy") == 2
+    remaining = {row["id"] for row in db.connect().execute(
+        "SELECT id FROM credentials").fetchall()}
+    assert remaining == {other}
+    cooldown_ids = {row["credential_id"] for row in db.connect().execute(
+        "SELECT credential_id FROM credential_model_cooldowns").fetchall()}
+    assert cooldown_ids == {other}
+    # 渠道已空 / 不存在的渠道都是幂等 0，不误删其他渠道
+    assert credentials.delete_provider("codebuddy") == 0
+    assert credentials.delete_provider("ghost") == 0
+    assert {row["id"] for row in db.connect().execute(
+        "SELECT id FROM credentials").fetchall()} == {other}
+
 def test_repo_revive_keeps_upstream_cooldown_unless_forced(repo):
     """`revive` 保留「上游点名恢复时刻」的冷却，`force=True` 才清。
 

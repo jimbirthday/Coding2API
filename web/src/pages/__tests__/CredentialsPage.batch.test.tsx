@@ -285,4 +285,54 @@ describe("CredentialsPage 批量运维", () => {
     await waitFor(() => expect(screen.getByTestId("credentials-batch-result")).toBeInTheDocument());
     expect(batchCall(spy).ids).toEqual(["cb1"]);
   });
+
+  it("清空渠道需要二次确认：取消不发请求，确认后删除并刷新列表", async () => {
+    const spy = mockFetch({
+      "/api/credentials/provider/codebuddy": {
+        provider: "codebuddy", deleted: 2,
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "主号" }),
+        makeCredential({ id: "cb2", provider: "codebuddy", nickname: "备用号" }),
+        makeCredential({ id: "tr1", provider: "trae", nickname: "TRAE" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+
+    const deleteCalls = () => spy.mock.calls.filter(
+      ([url, init]) => String(url) === "/api/credentials/provider/codebuddy"
+        && (init as RequestInit | undefined)?.method === "DELETE",
+    );
+    await userEvent.click(screen.getByTestId("clear-provider-codebuddy"));
+    expect(screen.getByTestId("clear-provider-confirm-codebuddy"))
+      .toHaveTextContent("确认删除 2 个");
+    expect(deleteCalls()).toHaveLength(0);
+
+    await userEvent.click(screen.getByTestId("clear-provider-cancel-codebuddy"));
+    expect(screen.queryByTestId("clear-provider-confirm-codebuddy")).not.toBeInTheDocument();
+    expect(deleteCalls()).toHaveLength(0);
+
+    await userEvent.click(screen.getByTestId("clear-provider-codebuddy"));
+    await userEvent.click(screen.getByTestId("clear-provider-confirm-codebuddy"));
+    await waitFor(() => expect(deleteCalls()).toHaveLength(1));
+    expect(screen.getByTestId("credentials-notice"))
+      .toHaveTextContent("已清空「CodeBuddy」：删除 2 个账号。");
+    // 删除成功后重新拉列表（refresh），而不是只靠本地状态猜结果
+    const listCalls = () => spy.mock.calls.filter(
+      ([url, init]) => String(url).includes("/api/credentials")
+        && !String(url).includes("/provider/")
+        && ((init as RequestInit | undefined)?.method ?? "GET") === "GET",
+    );
+    await waitFor(() => expect(listCalls().length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("只读用户看不到清空渠道入口", async () => {
+    mockFetch({ "/api/credentials": listBody([
+      makeCredential({ id: "cb1", provider: "codebuddy" }),
+    ], false) });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    expect(screen.queryByTestId("clear-provider-codebuddy")).not.toBeInTheDocument();
+  });
 });

@@ -410,3 +410,46 @@ def test_batch_rejects_viewer(tmp_path):
         response = client.post("/api/credentials/batch",
                                json={"action": "probe", "ids": ["cred_1"]})
         assert response.status_code == 403
+        assert client.delete(
+            "/api/credentials/provider/codebuddy").status_code == 403
+
+
+def test_delete_provider_credentials_deletes_all_and_audits(batch_app):
+    """渠道级删除：一次清空目标渠道、保留其他渠道，并落一条汇总审计。"""
+    app, client = batch_app
+    first = _add(app)
+    second = _add(app)
+    other = _add(app, "trae")
+
+    response = client.delete("/api/credentials/provider/codebuddy")
+    assert response.status_code == 200
+    assert response.json() == {"provider": "codebuddy", "deleted": 2}
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert first not in rows and second not in rows
+    assert rows[other]["provider"] == "trae"
+    events = app.state.audit.query(action="credential.delete")
+    assert len(events) == 1
+    assert events[0]["target"] is None
+    assert events[0]["detail"] == "渠道 codebuddy：删除 2 条"
+
+    # 再删一次是幂等成功：渠道已经空了，返回 deleted=0（不是 404/400）
+    assert client.delete("/api/credentials/provider/codebuddy").json() == {
+        "provider": "codebuddy", "deleted": 0}
+    events = app.state.audit.query(action="credential.delete")
+    assert len(events) == 2
+    assert {event["detail"] for event in events} == {
+        "渠道 codebuddy：删除 2 条", "渠道 codebuddy：删除 0 条"}
+
+
+def test_delete_provider_rejects_unknown_provider_and_csrf(batch_app):
+    app, client = batch_app
+    before = {row["id"] for row in app.state.credentials.list_all()}
+
+    assert client.delete(
+        "/api/credentials/provider/ghost").status_code == 400
+    rejected = client.delete(
+        "/api/credentials/provider/codebuddy",
+        headers={"Origin": "http://evil.example.com"},
+    )
+    assert rejected.status_code == 403
+    assert {row["id"] for row in app.state.credentials.list_all()} == before

@@ -498,6 +498,7 @@ export GOOGLE_GENAI_BASE_URL=http://127.0.0.1:8000   # SDK 会自拼 /v1beta
 - **暂停是显式状态而非取反**：`toggle` 的 `enabled` 由请求体给出 → 操作条拆「暂停」/「取消暂停」两按钮。
 - **「恢复」≠「取消暂停」**：前者 `revive`（解系统硬禁用，需先重新登录）；后者 `toggle enabled=true`。
 - **「恢复」默认保留上游点名的冷却**：`revive` 只解硬禁用、清本地冷却与模型级条目；冷却来源属于「上游点名恢复时刻」（限流 / 余额 / 权益 / 风控，即 `cooling_kind` ∈ `UPSTREAM_COOLDOWN_KINDS`）时**保留**——清掉只会立刻再撞一次上游（实测 2026-11-03 12:22–12:23 三次恢复 zen 凭证，每次都在恢复时顺手解掉刚写入的 429 冷却，下一请求再撞同一个 429）。要强制清除走 `force=true`（单条端点请求体 / 批量 `force`，前端菜单项「强制恢复」）。
+- **清空渠道**：`DELETE /api/credentials/provider/{provider}` 一次删除该渠道全部账号，返回 `{provider, deleted}`；未知渠道 400，渠道本来为空返回 `deleted: 0`。这是专用端点而非通用批量的 `delete` 动作——不可撤销，管理台在渠道组头单独做二次确认，并落一条 `credential.delete` 汇总审计。
 - 只收已有单条端点的动作：`refresh` / `delete` 不走此通道。
 - **审计只记一条汇总**（`toggle` / `revive`）。审计写失败只记 warning，不影响操作结果。
 

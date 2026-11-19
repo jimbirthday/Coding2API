@@ -487,6 +487,7 @@ The credentials page offers multi-select plus batch bar (probe / check-in / paus
 - **A failed check-in is a result, not a failure**: an upstream refusal (account disabled / session expired / rate limited) returns `ok=false` with a readable `message`, never 500 — otherwise the console only says "check-in failed" and hides the real reason.
 - **Pause is explicit state, not toggle-flip**: `enabled` comes from body → bar has separate *Pause* / *Unpause* buttons.
 - **Revive ≠ unpause**: revive clears system hard-disable (needs re-login first); unpause sets `toggle enabled=true`.
+- **Clear a channel**: `DELETE /api/credentials/provider/{provider}` removes every credential of that channel and returns `{provider, deleted}`; unknown channels are 400, an already-empty channel returns `deleted: 0`. It is a dedicated endpoint rather than a generic batch `delete`: the action is irreversible, the console requires a separate confirmation on the channel header, and one summary `credential.delete` audit row is written.
 - Only actions with existing single-item endpoints: `refresh` and `delete` are excluded.
 - **Audit writes one summary row** (`toggle` / `revive`); audit failure logs warning and does not fail operation.
 
