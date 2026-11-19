@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # 最小权限：CI 只需要读代码（checkout），不发布任何制品。
 # GitHub Actions 的默认 GITHUB_TOKEN 是 repo 写权限，被恶意 workflow 改写
