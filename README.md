@@ -136,7 +136,7 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
    - **Qoder / CodeArts**：设备码 / OAuth2 授权码登录（CodeArts 授权后把打不开的本地回调链接粘回页面）。
    - **OfficeAce**：点「登录 OfficeAce」走华为云授权（回调由云端承接）。
    - **小浣熊 / 灵犀**：无登录按钮，只能粘网页会话凭据（小浣熊 `{"access_token":"<xhx_token>"}`，灵犀整段 Cookie 或裸 `wps_sid`）。
-   - **通用粘法**：「JSON 导入」框同时接受整段 Cookie 和浏览器 DevTools → Network → 右键请求 → **Copy as cURL (bash)**。后者带 `Cookie:` / `Authorization:` 头，HttpOnly cookie 也能拿到；内容有明确特征（`wps_sid` / `xhx_token` / TRAE 字段 / AK·SK 等）时自动识别渠道，成功导入后会记住该渠道。
+   - **通用粘法**：「JSON 导入」框同时接受整段 Cookie 和浏览器 DevTools → Network → 右键请求 → **Copy as cURL (bash)**。后者带 `Cookie:` / `Authorization:` 头，HttpOnly cookie 也能拿到；内容有明确特征（`wps_sid` / `xhx_token` / TRAE 字段 / AK·SK 等）时自动识别渠道，成功导入后会记住该渠道。也支持「选择文件」直接读 `.json` / `.txt`；CodeArts 官方插件导出的单账号对象或单元素数组可直接导入。
    - **OpenCode Zen / Kilo**：无需添加，启动自动出虚拟凭证（删了可在同面板补回）。
 2. 「API Key」建 `sk-...`（明文仅显示一次）。
 3. 调用：
@@ -234,6 +234,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ### CodeArts（`codearts`）
 
 [华为云 CodeArts](https://codearts.huaweicloud.com)，需真实账号：点「登录 CodeArts」→ 授权后浏览器跳到打不开的本地地址 → **整条链接**粘回页面换 STS 凭证（AK/SK + security_token + refresh_token + DPoP 私钥），加密入库。
+
+**插件 JSON 导入**：CodeArts 插件导出的 `dpop_private_key` / `cloud_dragon_token` / `code_verifier` / `expiration` 可直接粘贴或选文件导入；前两者分别归一为 `dpop_private_jwk` / `security_token`，因此导入后仍能正常聊天和预刷新。
 
 **令牌刷新刚性**：refresh_token 与 `client_id=codearts-agent`、DPoP 私钥三者绑定、一次性；刷新后必须回写新 refresh_token。预刷新任务自动完成（DPoP ES256/P-256）。窗口封顶 45 分钟，须宽于轮询周期。凭据作废 → 标「需重新登录」+ 停重试。
 

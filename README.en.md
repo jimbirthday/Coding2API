@@ -135,7 +135,7 @@ echo "$PASSWORD" | python3 scripts/create_user.py alice --role admin --password-
    - **Qoder / CodeArts**: device-code / OAuth2 authorization-code login (CodeArts: paste the unreachable local callback URL back).
    - **OfficeAce**: *Log in to OfficeAce*, Huawei Cloud authorization (callback handled in the cloud).
    - **Raccoon / Lingxi**: no login button — paste a web session credential instead (Raccoon `{"access_token":"<xhx_token>"}`, Lingxi the whole Cookie or a bare `wps_sid`).
-   - **Any channel**: the *JSON import* box also accepts a raw Cookie header and a browser DevTools → Network → right-click request → **Copy as cURL (bash)** command. The latter carries the `Cookie:` / `Authorization:` header, so HttpOnly cookies work too; unambiguous markers (`wps_sid`, `xhx_token`, TRAE fields, AK/SK) auto-select the channel, and the last used channel is remembered.
+   - **Any channel**: the *JSON import* box also accepts a raw Cookie header and a browser DevTools → Network → right-click request → **Copy as cURL (bash)** command. The latter carries the `Cookie:` / `Authorization:` header, so HttpOnly cookies work too; unambiguous markers (`wps_sid`, `xhx_token`, TRAE fields, AK/SK) auto-select the channel, and the last used channel is remembered. You can also pick a `.json` / `.txt` file; single-account CodeArts plugin exports (object or one-element array) import directly.
    - **OpenCode Zen / Kilo**: nothing to add — a virtual credential is seeded at startup (re-addable from the same panel).
 2. **API keys** — create an `sk-...` (plaintext shown once).
 3. Call it:
@@ -229,6 +229,8 @@ Free models at [Kilo](https://kilo.ai) (`api.kilo.ai/api/gateway`), no login. St
 ### CodeArts (`codearts`)
 
 [Huawei Cloud CodeArts](https://codearts.huaweicloud.com), real account: *Log in to CodeArts*, authorize, then paste the **unreachable local URL** back; server exchanges it for STS credentials (AK/SK + security_token + refresh_token + DPoP key) and stores them encrypted.
+
+**Plugin JSON import**: exported `dpop_private_key` / `cloud_dragon_token` / `code_verifier` / `expiration` fields are accepted directly. The first two normalize to `dpop_private_jwk` / `security_token`, so chat and pre-refresh keep working after import.
 
 **Token refresh is rigid**: refresh_token, `client_id=codearts-agent` and DPoP key are bound and single-use; new refresh_token must be written back. Handled by pre-refresh task (DPoP ES256/P-256). Window capped at 45 minutes and must be wider than polling interval. Revoked credential marked "re-login required", stops automatic retries.
 

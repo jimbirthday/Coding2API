@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, X } from "lucide-react";
+import { FileUp, Plus, X } from "lucide-react";
 import { api } from "../api/client";
 import { PROVIDER_LABEL } from "../api/providers";
 import type { Provider, TosRisk } from "../api/types";
@@ -133,6 +133,7 @@ export function AddCredentialDialog({
   const [nickname, setNickname] = useState("");
   const [raw, setRaw] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
   const detected = useMemo(() => detectProvider(raw), [raw]);
   const effectiveProvider = manualProvider ?? detected ?? importProvider;
   // TRAE 轮询要比较「登录发起时 vs 现在」的凭证数量；ref 让 interval 里
@@ -662,7 +663,7 @@ export function AddCredentialDialog({
             <Field
               label="凭证 JSON / Cookie / cURL"
               htmlFor="import-payload"
-              hint='三种粘法都收：① 渠道 JSON（选渠道自动填模板，已手写内容不会被覆盖）；② 整段 Cookie（灵犀 wps_sid、小浣熊 xhx_token）；③ 浏览器 DevTools → Network → 右键请求 → Copy as cURL (bash)（含 HttpOnly Cookie，最省事）。识别到渠道会自动切换。'
+              hint='三种粘法都收：① 渠道 JSON（选渠道自动填模板，已手写内容不会被覆盖）；② 整段 Cookie（灵犀 wps_sid、小浣熊 xhx_token）；③ 浏览器 DevTools → Network → 右键请求 → Copy as cURL (bash)（含 HttpOnly Cookie，最省事）。也可直接选择 CodeArts 等渠道导出的 JSON 文件。识别到渠道会自动切换。'
             >
               <Textarea
                 rows={5}
@@ -678,6 +679,38 @@ export function AddCredentialDialog({
                 }}
               />
             </Field>
+            <div className="flex items-center gap-2">
+              <input
+                ref={importFileRef}
+                type="file"
+                accept=".json,.txt"
+                className="hidden"
+                data-testid="import-file"
+                onChange={async (event) => {
+                  const file = event.target.files?.[0];
+                  // 允许随后重复选择同一个文件
+                  event.target.value = "";
+                  if (!file) return;
+                  try {
+                    setRaw(await file.text());
+                    setManualProvider(null);
+                    setImportError(null);
+                  } catch {
+                    setImportError("读取文件失败");
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                data-testid="import-pick-file"
+                onClick={() => importFileRef.current?.click()}
+              >
+                <FileUp className="size-4" /> 选择文件
+              </Button>
+              <span className="text-xs text-muted-foreground">支持单账号 .json / .txt</span>
+            </div>
             {detected && (
               <p
                 className="text-xs text-muted-foreground"

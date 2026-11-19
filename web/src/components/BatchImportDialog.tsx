@@ -4,6 +4,7 @@ import { api, ApiError } from "../api/client";
 import type { BatchImportEntry, BatchImportResult } from "../api/types";
 import { useDialogFocus } from "../hooks/useDialogFocus";
 import { Button, Notice } from "../ui";
+import { providerFromCredentialObject } from "../lib/credentialImport";
 
 type ParseError = { line: number; message: string };
 
@@ -13,6 +14,8 @@ type ParseError = { line: number; message: string };
  * 两种写法都收：
  * - JSON 数组：`[{provider, credential, nickname?, tags?}, …]`
  * - JSONL：一行一个对象（脚本导出/手工粘贴都常见）
+ * 元素也可以是渠道直出的原始凭证对象（如 CodeArts 插件导出的账号 JSON），
+ * 此时按字段特征识别 `provider`；识别不出的仍要求显式 `provider`。
  *
  * 解析与校验分开：某一行坏了只记该行，其余照常导入（后端也是同一口径）。
  * 行号从 1 开始，数组模式下用元素序号。
@@ -31,18 +34,33 @@ export function parseBatchText(text: string): {
       return;
     }
     const item = raw as Record<string, unknown>;
-    if (typeof item.provider !== "string" || !item.provider.trim()) {
-      errors.push({ line, message: "缺少 provider" });
+    const envelope = "provider" in item || "credential" in item;
+    if (envelope) {
+      if (typeof item.provider !== "string" || !item.provider.trim()) {
+        errors.push({ line, message: "缺少 provider" });
+        return;
+      }
+      if (typeof item.credential !== "object" || item.credential === null
+          || Array.isArray(item.credential)) {
+        errors.push({ line, message: "credential 必须是对象" });
+        return;
+      }
+      entries.push({
+        provider: item.provider.trim(),
+        credential: item.credential,
+        nickname: typeof item.nickname === "string" ? item.nickname : "",
+        tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
+      });
       return;
     }
-    if (typeof item.credential !== "object" || item.credential === null
-        || Array.isArray(item.credential)) {
-      errors.push({ line, message: "credential 必须是对象" });
+    const detected = providerFromCredentialObject(item);
+    if (!detected) {
+      errors.push({ line, message: "缺少 provider（或无法识别渠道）" });
       return;
     }
     entries.push({
-      provider: item.provider.trim(),
-      credential: item.credential,
+      provider: detected,
+      credential: item,
       nickname: typeof item.nickname === "string" ? item.nickname : "",
       tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
     });
@@ -147,6 +165,7 @@ export function BatchImportDialog({
         <p className="text-xs text-muted-foreground">
           粘贴 JSON 数组或逐行 JSON（JSONL），每条形如
           <code className="mx-1">{"{provider, credential, nickname?, tags?}"}</code>。
+          也可直接粘贴渠道插件导出的原始凭证对象（如 CodeArts 账号 JSON），按字段自动识别渠道。
           同渠道内容完全相同的凭证会自动跳过。
         </p>
 

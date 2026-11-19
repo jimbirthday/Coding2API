@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AddCredentialDialog } from "../AddCredentialDialog";
@@ -128,6 +128,47 @@ describe("AddCredentialDialog", () => {
     });
     expect(props.onImported).toHaveBeenCalledWith(expect.stringContaining("凭证已导入"));
     expect(localStorage.getItem("coding2api.importProvider")).toBe("lingxi");
+  });
+
+  it("选择 CodeArts 导出的 JSON 文件会自动识别渠道并导入", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+      return jsonResponse({ id: "cred_codearts", tos: { level: "gray", reason: "r", basis: "b" } });
+    }));
+    const props = renderDialog();
+    await userEvent.click(screen.getByTestId("add-credential-tab-import"));
+
+    const exported = JSON.stringify([{
+      access_key_id: "HSTAY3L2BBQA29A6JEFX",
+      secret_access_key: "SECRET",
+      cloud_dragon_token: "SECURITY",
+      refresh_token: "rt",
+      code_verifier: "verifier",
+      user_id: "user",
+      user_name: "hw095751910715860",
+      domain_id: "domain",
+      expiration: "2026-11-19T04:30:00.515Z",
+      dpop_private_key: { kty: "EC", crv: "P-256", d: "x" },
+    }]);
+    const file = new File([exported], "codearts.json", { type: "application/json" });
+    await userEvent.upload(screen.getByTestId("import-file"), file);
+
+    await waitFor(() => expect(screen.getByTestId("import-payload")).toHaveValue(exported));
+    expect(screen.getByTestId("import-detected")).toHaveTextContent("CodeArts");
+
+    await userEvent.click(screen.getByTestId("import-submit"));
+    const posted = calls.find((call) => call.url.endsWith("/api/credentials"));
+    expect(posted?.body).toMatchObject({
+      provider: "codearts",
+      credential: {
+        access_key_id: "HSTAY3L2BBQA29A6JEFX",
+        secret_access_key: "SECRET",
+        cloud_dragon_token: "SECURITY",
+        dpop_private_key: { kty: "EC", crv: "P-256", d: "x" },
+      },
+    });
+    expect(props.onImported).toHaveBeenCalledWith(expect.stringContaining("凭证已导入"));
   });
 
   it("已有灵犀凭证时提示新登录会顶掉旧会话", async () => {

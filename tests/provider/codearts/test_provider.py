@@ -47,6 +47,32 @@ def test_provider_import_credential_validates():
         "dpop_private_jwk": _jwk()})
     assert with_jwk["dpop_private_jwk"]["kty"] == "EC"
 
+
+def test_provider_import_accepts_codearts_plugin_json_file():
+    """CodeArts 插件导出的 JSON（数组内单对象）可无损归一后落库。"""
+    provider = CodeArtsProvider()
+    private = _jwk()
+    saved = provider.import_credential({
+        "access_key_id": "AK",
+        "secret_access_key": "SK",
+        "refresh_token": "rt",
+        "code_verifier": "verifier",
+        "domain_id": "domain",
+        "user_id": "user",
+        "user_name": "hw095751910715860",
+        "cloud_dragon_token": "SECURITY",
+        "expiration": "2026-11-19T04:30:00.515Z",
+        "dpop_private_key": private,
+    })
+    assert saved["security_token"] == "SECURITY"
+    assert saved["dpop_private_jwk"] == private
+    assert saved["uid"] == "user"
+    assert saved["user_name"] == "hw095751910715860"
+    assert saved["domain_id"] == "domain"
+    assert saved["refresh_token"] == "rt"
+    assert saved["code_verifier"] == "verifier"
+    assert saved["expiration"] > 0
+
 def test_provider_import_credential_rejects_bad_input():
     provider = CodeArtsProvider()
     with pytest.raises(codearts_events.UpstreamProtocolViolation, match="not an object"):

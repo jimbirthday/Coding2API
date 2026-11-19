@@ -113,12 +113,20 @@ class CodeArtsCredential:
             access_key_id=str(raw.get("access_key_id") or raw.get("accessKeyId") or ""),
             secret_access_key=str(
                 raw.get("secret_access_key") or raw.get("secretAccessKey") or ""),
-            security_token=str(raw.get("security_token") or raw.get("securityToken") or ""),
+            # 官方插件导出的 JSON 把 STS security_token 叫 `cloud_dragon_token`
+            # （聊天时同样放在 `x-auth-token`），这里与规范名一并认。
+            security_token=str(raw.get("security_token") or raw.get("securityToken")
+                               or raw.get("cloud_dragon_token")
+                               or raw.get("cloudDragonToken") or ""),
             expiration=_expiration_from_raw(raw.get("expiration")),
             refresh_token=str(raw.get("refresh_token") or raw.get("refreshToken") or ""),
             client_id=str(raw.get("client_id") or raw.get("clientId") or CLIENT_ID),
             code_verifier=str(raw.get("code_verifier") or raw.get("codeVerifier") or ""),
-            dpop_private_jwk=_jwk_from_raw(raw.get("dpop_private_jwk")),
+            # 插件导出用 `dpop_private_key`；落库统一为 `dpop_private_jwk`
+            # （与 refresh_token 绑定，丢了就无法刷新）。
+            dpop_private_jwk=_jwk_from_raw(
+                raw.get("dpop_private_jwk") or raw.get("dpopPrivateKey")
+                or raw.get("dpop_private_key")),
             domain=str(raw.get("domain") or ""),
             domain_id=str(raw.get("domain_id") or raw.get("domainId") or ""),
             nickname=str(raw.get("nickname") or ""),

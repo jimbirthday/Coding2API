@@ -21,6 +21,23 @@ describe("parseBatchText", () => {
     expect(errors.map((e) => e.line)).toEqual([2, 3, 4]);
   });
 
+  it("渠道插件导出的原始凭证对象按字段识别 provider", () => {
+    const { entries, errors } = parseBatchText(JSON.stringify([
+      {
+        access_key_id: "AK",
+        secret_access_key: "SK",
+        cloud_dragon_token: "SECURITY",
+        dpop_private_key: { kty: "EC", d: "x" },
+        user_name: "alice",
+      },
+      { foo: "bar" },
+    ]));
+    expect(errors).toEqual([{ line: 2, message: "缺少 provider（或无法识别渠道）" }]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].provider).toBe("codearts");
+    expect(entries[0].credential).toMatchObject({ access_key_id: "AK" });
+  });
+
   it("JSONL 逐行解析，坏行只算自己", () => {
     const text = [
       '{"provider":"trae","credential":{"accessToken":"a"}}',

@@ -36,9 +36,41 @@ describe("parseCredentialInput", () => {
   });
 
   it("JSON 数组提示走批量导入", () => {
-    const parsed = parseCredentialInput('[{"provider":"lingxi"}]', "codebuddy");
+    const parsed = parseCredentialInput(
+      '[{"provider":"lingxi"},{"provider":"raccoon"}]',
+      "codebuddy",
+    );
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.error).toContain("批量导入");
+  });
+
+  it("官方插件导出的单账号 JSON 数组会解包并识别 CodeArts", () => {
+    const parsed = parseCredentialInput(
+      JSON.stringify([{
+        access_key_id: "AK",
+        secret_access_key: "SK",
+        cloud_dragon_token: "SECURITY",
+        dpop_private_key: { kty: "EC", crv: "P-256", d: "x" },
+      }]),
+      "codebuddy",
+    );
+    expect(parsed.ok && parsed.provider).toBe("codearts");
+    expect(parsed.ok && parsed.credential).toMatchObject({
+      access_key_id: "AK",
+      cloud_dragon_token: "SECURITY",
+    });
+  });
+
+  it("单元素数组里不是对象时报错", () => {
+    const parsed = parseCredentialInput('["not-an-object"]', "codebuddy");
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.error).toContain("JSON 对象");
+  });
+
+  it("空数组直接报错", () => {
+    const parsed = parseCredentialInput("[]", "codebuddy");
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.error).toContain("数组为空");
   });
 
   it("TRAE 凭证按字段名识别，即使下拉停在别的渠道", () => {

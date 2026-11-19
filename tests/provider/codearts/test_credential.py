@@ -72,6 +72,23 @@ def test_credential_from_dict_accepts_camel_case_and_junk():
     # 缺 client_id 回落默认值
     assert CodeArtsCredential.from_dict({}).client_id == codearts_events.CLIENT_ID
 
+
+def test_credential_from_dict_accepts_codearts_plugin_export_aliases():
+    """官方插件导出用 `cloud_dragon_token` / `dpop_private_key`。"""
+    private = _jwk()
+    credential = CodeArtsCredential.from_dict({
+        "cloud_dragon_token": "CDT",
+        "dpop_private_key": private,
+    })
+    assert credential.security_token == "CDT"
+    assert credential.dpop_private_jwk == private
+    # camelCase 变体同样认，避免大小写差异把绑定项丢掉
+    camel = CodeArtsCredential.from_dict({
+        "cloudDragonToken": "CDT2", "dpopPrivateKey": private,
+    })
+    assert camel.security_token == "CDT2"
+    assert camel.dpop_private_jwk == private
+
 def test_credential_expiration_from_raw_all_forms():
     assert _expiration_from_raw(True) == 0
     assert _expiration_from_raw(1700000000) == 1700000000

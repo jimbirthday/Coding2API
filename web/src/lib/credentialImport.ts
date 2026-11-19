@@ -81,10 +81,18 @@ function providerFromCookie(cookie: string): Provider | null {
   return null;
 }
 
-function providerFromObject(value: Record<string, unknown>): Provider | null {
+/** 从单个凭据对象识别渠道；无法无歧义识别时返回 null。 */
+export function providerFromCredentialObject(
+  value: Record<string, unknown>,
+): Provider | null {
   const has = (key: string) => Object.prototype.hasOwnProperty.call(value, key);
   if (has("accessToken") || has("refreshToken")) return "trae";
-  if (has("access_key_id") || has("secret_access_key")) return "codearts";
+  if (
+    has("access_key_id") || has("secret_access_key")
+    || has("cloud_dragon_token") || has("dpop_private_key")
+  ) {
+    return "codearts";
+  }
   if (has("model_app_key") || has("model_app_secret") || has("model_base_url")) {
     return "officeace";
   }
@@ -217,7 +225,8 @@ export function parseCredentialInput(
     return wrapRaw(detected ?? fallback, { cookie, token }, detected !== null);
   }
 
-  // JSON：单个对象继续；数组提示走批量导入
+  // JSON：单个对象继续；单元素数组也解包（官方插件常把账号导出成数组），
+  // 多条仍提示走批量导入
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     let parsed: unknown;
     try {
@@ -229,9 +238,22 @@ export function parseCredentialInput(
       };
     }
     if (Array.isArray(parsed)) {
+      if (parsed.length === 0) {
+        return { ok: false, error: "凭证 JSON 数组为空" };
+      }
+      if (parsed.length === 1) {
+        parsed = parsed[0];
+      } else {
+        return {
+          ok: false,
+          error: "检测到多条凭证：请用凭证页右上角的「批量导入」",
+        };
+      }
+    }
+    if (Array.isArray(parsed)) {
       return {
         ok: false,
-        error: "检测到多条凭证：请用凭证页右上角的「批量导入」",
+        error: "凭证 JSON 数组里必须是对象",
       };
     }
     if (typeof parsed !== "object" || parsed === null) {
@@ -249,7 +271,7 @@ export function parseCredentialInput(
       const declaredProvider =
         typeof declared === "string" && IMPORT_PROVIDERS.includes(declared as Provider)
           ? (declared as Provider)
-          : providerFromObject(object);
+          : providerFromCredentialObject(object);
       return {
         ok: true,
         provider: declaredProvider ?? fallback,
@@ -257,7 +279,7 @@ export function parseCredentialInput(
         detected: declaredProvider,
       };
     }
-    const detected = detect ? providerFromObject(object) : null;
+    const detected = detect ? providerFromCredentialObject(object) : null;
     return {
       ok: true,
       provider: detected ?? fallback,
