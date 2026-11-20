@@ -380,6 +380,16 @@ class TaskRunner:
         task = self._require(self._upstream_status, "upstream status")
         return await task.run_once()
 
+    async def refresh_credential(self, credential_id: str, *, force: bool = True,
+                                 revive: bool = True) -> dict[str, Any]:
+        """管理台手动 RT 刷新：复用 RefreshTask 的锁、Pacer 与终态处置。
+
+        单条端点与批量动作都走这里；周期任务仍由 `run_once` 驱动，两者共用
+        同一份实现，避免「手动能刷、定时不能刷」或重复消费一次性 RT。
+        """
+        return await self._refresh.refresh_credential(
+            credential_id, force=force, revive=revive)
+
     async def _loop(self, name: str, runner: Callable[[], Awaitable[object]],
                     interval: float | Callable[[], float],
                     key: str | None = None) -> None:

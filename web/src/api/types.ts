@@ -668,7 +668,27 @@ export interface CheckinResult {
 }
 
 /** 批量动作：与后端 `BATCH_ACTIONS` 同口径（只收已有单条端点的动作）。 */
-export type BatchAction = "probe" | "toggle" | "checkin" | "revive";
+export type BatchAction = "probe" | "toggle" | "checkin" | "revive" | "refresh";
+
+/**
+ * 手动 RT 刷新结果。
+ *
+ * `rotated`：refresh_token 是否轮转；`revived`：本次是否顺带解除硬禁用。
+ * `reason` 用于 no-op（例如并发刷新发现已被别人刷过），`error` 只表示失败。
+ */
+export interface RefreshDetail {
+  refreshed: boolean;
+  rotated: boolean;
+  /** 刷新后 access token 到期 epoch；未知为 0。 */
+  expires_at: number;
+  revived: boolean;
+  reason?: string;
+}
+
+export interface RefreshResult extends RefreshDetail {
+  ok: boolean;
+  error?: string;
+}
 
 /**
  * 批量执行结果的一行。
@@ -682,7 +702,7 @@ export interface BatchResultRow {
   id: string;
   ok: boolean;
   error?: string;
-  detail?: ProbeResult | CheckinResult;
+  detail?: ProbeResult | CheckinResult | RefreshDetail;
 }
 
 export interface BatchResult {

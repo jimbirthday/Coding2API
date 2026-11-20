@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -148,6 +148,9 @@ class Services:
     # 日志落库（`log_events`）：`/api/logs` 在内存环为空（刚重启）或要按
     # `request_id` 回溯时读它。None = 只有内存环（测试替身）。
     log_repo: Any = None
+    # 手动 RT 刷新（单条 / 批量）。由 lifespan 里的 TaskRunner 注入：刷新必须
+    # 复用 RefreshTask 的编辑锁与一次性 RT 轮转顺序，不能另建一条无锁路径。
+    refresh_credential: Callable[..., Awaitable[dict[str, Any]]] | None = None
 
 
 def get_services(request: Request) -> Services:

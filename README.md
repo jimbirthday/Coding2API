@@ -237,7 +237,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 **插件 JSON 导入**：CodeArts 插件导出的 `dpop_private_key` / `cloud_dragon_token` / `code_verifier` / `expiration` 可直接粘贴或选文件导入；前两者分别归一为 `dpop_private_jwk` / `security_token`，因此导入后仍能正常聊天和预刷新。
 
-**令牌刷新刚性**：refresh_token 与 `client_id=codearts-agent`、DPoP 私钥三者绑定、一次性；刷新后必须回写新 refresh_token。预刷新任务自动完成（DPoP ES256/P-256）。窗口封顶 45 分钟，须宽于轮询周期。凭据作废 → 标「需重新登录」+ 停重试。
+**令牌刷新刚性**：refresh_token 与 `client_id=codearts-agent`、DPoP 私钥三者绑定、一次性；刷新后必须回写新 refresh_token。预刷新任务自动完成（DPoP ES256/P-256）。窗口封顶 45 分钟，须宽于轮询周期。已过期或临近到期的号也可在凭证行「更多操作 → RT 刷新」或批量「RT 刷新」中立即续期；两条入口复用同一个 `RefreshTask`（编辑锁 + 快照去重），不会重复消费一次性 RT。凭据作废 → 标「需重新登录」+ 停重试。
 
 **每日签到**：`GET /v1/ops/delivery?channel=IDE` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`，后台每日自动领。活动按 `type=USER_LOGIN` 挑（`type` 缺失时读 `extra.triggerEvent` = `user.login`，两者是同一标识的两个字段），**`campaignId` 取当轮响应**（上游 2026-11 把签到活动从 ID 1 换成 34、面额 1000 → 100；写死 ID 会导致「签到显示成功、官网任务仍在、积分不涨」）；响应没给 `campaignId` 时该轮判失败重试，**不带 0 发写请求**。`CLAIMED` =「已领未确认」→ 两步一起做；**claim 成功但 confirm 失败按失败处理**（不回「签到成功」），下一轮补确认，避免「界面显示成功、积分未到账」（实测用户反馈）。失败按连续次数指数退避（10m → 20m → 40m → 封顶 1h，成功清零；管理台「立即运行」不受限制）。
 
@@ -488,9 +488,10 @@ export GOOGLE_GENAI_BASE_URL=http://127.0.0.1:8000   # SDK 会自拼 /v1beta
 
 ## 凭证批量运维
 
-凭证页支持多选 + 批量操作条（探测额度 / 每日签到 / 暂停 / 取消暂停 / 恢复）。
+凭证页支持多选 + 批量操作条（探测额度 / 每日签到 / RT 刷新 / 暂停 / 取消暂停 / 恢复）。
 
-- **端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive", ids: [...], enabled?, force?}`。一次 ≤200 条，重复 id 去重。`force` 只对 `revive` 有效（见下）。
+- **端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh", ids: [...], enabled?, force?}`。一次 ≤200 条，重复 id 去重。`force` 只对 `revive` 有效（见下）。
+- **手动 RT 刷新**：`POST /api/credentials/{id}/refresh` 无视预刷新窗口，立即用 refresh_token 换新 access token；成功后先落库轮转后的 RT，再解除硬禁用 / 本地冷却并排队重探额度。响应 `{ok, refreshed, rotated, expires_at, revived, reason?, error?}`，上游明确判票作废时是 `ok=false, error="relogin_required"`（HTTP 200，不是 500）。批量 `refresh` 逐条隔离并调用同一实现，成功后同样重探额度；两条入口都会写 `credential.refresh` 审计（批量只写一条汇总）。行内与批量入口仅对有刷新能力的渠道显示，手工 token 没有 RT 时逐条返回 `credential has no refresh_token`。
 - **批量导入**：`POST /api/credentials/batch-import`，body `{items: [{provider, credential, nickname?, tags?}]}`。一次 ≤100 条；逐条校验，坏条目只进 `failed`（带 `index` 与原因）；同渠道解密后内容完全一致视为重复，进 `skipped`。管理台凭证页「批量导入」支持粘贴 JSON 数组 / JSONL 或选文件。
 - **单条导出**：`GET /api/credentials/{id}/export` 返回与批量导入**同形**的 JSON（`provider` / `credential` / `nickname` / `tags`），可原样再导入。响应带 `Content-Disposition` 附件头与 `no-store`，内容是**明文凭证**——只对 admin/operator 开放，且落 `credential.export` 审计。管理台入口：凭证行「更多操作 → 导出凭证」。
 - **逐条隔离**：单条失败不影响其余。响应 `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`。
@@ -499,8 +500,8 @@ export GOOGLE_GENAI_BASE_URL=http://127.0.0.1:8000   # SDK 会自拼 /v1beta
 - **「恢复」≠「取消暂停」**：前者 `revive`（解系统硬禁用，需先重新登录）；后者 `toggle enabled=true`。
 - **「恢复」默认保留上游点名的冷却**：`revive` 只解硬禁用、清本地冷却与模型级条目；冷却来源属于「上游点名恢复时刻」（限流 / 余额 / 权益 / 风控，即 `cooling_kind` ∈ `UPSTREAM_COOLDOWN_KINDS`）时**保留**——清掉只会立刻再撞一次上游（实测 2026-11-03 12:22–12:23 三次恢复 zen 凭证，每次都在恢复时顺手解掉刚写入的 429 冷却，下一请求再撞同一个 429）。要强制清除走 `force=true`（单条端点请求体 / 批量 `force`，前端菜单项「强制恢复」）。
 - **清空渠道**：`DELETE /api/credentials/provider/{provider}` 一次删除该渠道全部账号，返回 `{provider, deleted}`；未知渠道 400，渠道本来为空返回 `deleted: 0`。这是专用端点而非通用批量的 `delete` 动作——不可撤销，管理台在渠道组头单独做二次确认，并落一条 `credential.delete` 汇总审计。
-- 只收已有单条端点的动作：`refresh` / `delete` 不走此通道。
-- **审计只记一条汇总**（`toggle` / `revive`）。审计写失败只记 warning，不影响操作结果。
+- 只收已有单条端点的动作：`delete` 不走此通道。
+- **审计只记一条汇总**（`toggle` / `revive` / `refresh`）。审计写失败只记 warning，不影响操作结果。
 
 ## 凭证限额护栏
 

@@ -28,6 +28,7 @@ import type {
   CredentialStats,
   ProbeResult,
   ProviderStats,
+  RefreshResult,
   Role,
   SessionInfo,
   StatsMetric,
@@ -333,6 +334,9 @@ export const api = {
     request<{ ok: boolean }>("/api/credentials/pin", { method: "POST", ...json({ credential_id: id }) }),
   deleteCredential: (id: string) =>
     request<{ ok: boolean }>(`/api/credentials/${id}`, { method: "DELETE" }),
+  /** 用 refresh_token 强制换新 access token（一次性 RT 由后端统一轮转）。 */
+  refreshCredential: (id: string) =>
+    request<RefreshResult>(`/api/credentials/${id}/refresh`, { method: "POST" }),
   /** 清空某渠道的全部账号（渠道级删除，需二次确认）。 */
   deleteProviderCredentials: (provider: string) =>
     request<{ provider: string; deleted: number }>(

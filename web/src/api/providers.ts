@@ -96,6 +96,20 @@ export const CHECKIN_PROVIDERS: ReadonlySet<string> = new Set([
   "lingxi",
 ]);
 
+/** 支持 refresh_token 换新的渠道（与后端 provider 上的 `refresh` 能力同口径）。
+ *
+ * 手工导入的 access token 若没有 refresh_token 仍会失败，但那是凭证问题，
+ * 不是渠道能力问题；前端因此按渠道显示入口，逐条结果由后端给出。
+ */
+export const REFRESH_PROVIDERS: ReadonlySet<string> = new Set([
+  "codebuddy",
+  "codebuddy_intl",
+  "trae",
+  "qoder",
+  "codearts",
+  "officeace",
+]);
+
 /** 渠道排序权重；未知渠道排在已知渠道之后。 */
 export function providerRank(provider: string): number {
   const index = PROVIDER_ORDER.indexOf(provider as Provider);

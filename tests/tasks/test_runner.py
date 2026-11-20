@@ -451,6 +451,10 @@ def test_lifespan_starts_task_runner_in_background(monkeypatch, tmp_path):
             self.stopped = True
             self.stop_after_start = self.start_completed
 
+        async def refresh_credential(self, *_args, **_kwargs):
+            """lifespan 只负责把入口挂到 Services；本用例不触发手动刷新。"""
+            raise AssertionError("manual refresh should not run during startup")
+
     fake = FakeRunner()
     monkeypatch.setattr("src.main.build_runner", lambda *a, **k: fake)
 

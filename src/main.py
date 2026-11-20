@@ -826,6 +826,9 @@ def build_app(settings: Settings | None = None, *, providers: dict | None = None
                               on_checkin_success=schedule_probe,
                               openrouter_catalog_minutes=(
                                   lambda: runtime.openrouter_catalog_minutes))
+        # 管理台手动 RT 刷新复用 RefreshTask：单条 / 批量端点都经这一个入口，
+        # 与周期预刷新共享编辑锁和一次性 RT 的「先落库再同步」顺序。
+        services_.refresh_credential = runner.refresh_credential
         app_.state.task_runner = runner
         # **首轮探测/刷新放后台**：`start()` 内联 await 的是两个真实的上游网络
         # 调用（quota_probe 每凭证一个请求、token 预刷新同样出网），最慢十几秒；

@@ -79,6 +79,83 @@ describe("CredentialsPage 批量运维", () => {
     await waitFor(() => expect(screen.queryByTestId("credentials-batch-bar")).not.toBeInTheDocument());
   });
 
+  it("行内 RT 刷新调用单条接口并提示新 token 到期时间", async () => {
+    const spy = mockFetch({
+      "/api/credentials/cb1/refresh": {
+        ok: true, refreshed: true, rotated: true, expires_at: 1_700_000_000,
+        revived: true, reason: "",
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "主号" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-cb1"));
+    await userEvent.click(screen.getByRole("menuitem", { name: "RT 刷新" }));
+
+    await waitFor(() => expect(spy.mock.calls.some(
+      ([url, init]) => String(url) === "/api/credentials/cb1/refresh"
+        && (init as RequestInit | undefined)?.method === "POST",
+    )).toBe(true));
+    const notice = await screen.findByTestId("credentials-notice");
+    expect(notice).toHaveTextContent("RT 刷新成功");
+    expect(notice).toHaveTextContent("已解除硬禁用并恢复调度");
+  });
+
+  it("勾选后提交批量 RT 刷新，并逐条翻译失败原因", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "refresh", total: 2, succeeded: 1, failed: 1,
+        results: [
+          { id: "cb1", ok: true, detail: {
+            refreshed: true, rotated: true, expires_at: 1_700_000_000,
+            revived: true, reason: "",
+          } },
+          { id: "cb2", ok: false, error: "relogin_required" },
+        ],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "主号" }),
+        makeCredential({ id: "cb2", provider: "codebuddy", nickname: "备用号" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("group-select-codebuddy"));
+    await userEvent.click(screen.getByTestId("batch-refresh"));
+
+    const toast = await screen.findByTestId("credentials-batch-result");
+    expect(batchCall(spy)).toEqual({ action: "refresh", ids: ["cb1", "cb2"] });
+    expect(toast).toHaveTextContent("刷新令牌完成：成功 1 / 2，失败 1");
+    expect(within(toast).getByTestId("batch-failure"))
+      .toHaveTextContent("备用号：refresh_token 已失效，必须重新登录");
+  });
+
+  it("不支持 RT 刷新的渠道不显示行内入口", async () => {
+    mockFetch({ "/api/credentials": listBody([
+      makeCredential({ id: "lx1", provider: "lingxi", nickname: "灵犀" }),
+    ]) });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("actions-lx1"));
+    expect(screen.queryByRole("menuitem", { name: "RT 刷新" })).not.toBeInTheDocument();
+  });
+
+  it("只读用户看不到行内 RT 刷新入口", async () => {
+    mockFetch({ "/api/credentials": listBody([
+      makeCredential({ id: "cb1", provider: "codebuddy", nickname: "主号" }),
+    ], false) });
+    renderPage(<CredentialsPage />, READER);
+    await settle();
+    await expandCredentialGroups();
+    expect(screen.queryByTestId("actions-cb1")).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "RT 刷新" })).not.toBeInTheDocument();
+  });
+
   it("批量暂停显式传 enabled=false（不做各自取反）", async () => {
     const spy = mockFetch({
       "/api/credentials/batch": {

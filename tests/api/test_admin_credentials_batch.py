@@ -17,7 +17,7 @@ from src.api.admin_credentials import BATCH_MAX_IDS
 from src.auth.session import create_session_token
 from src.config import Settings
 from src.main import build_app
-from src.provider.base import Quota
+from src.provider.base import Quota, UpstreamReloginRequired
 from src.provider.codebuddy.checkin import CheckinResult
 from tests.helpers.constants import SECRET
 
@@ -46,10 +46,34 @@ class _StubProvider:
         return self._checkin
 
 
+class _RefreshProvider:
+    """RT 刷新桩：记录调用并返回轮转后的 token；可注入终态失败。"""
+
+    id = "codebuddy"
+    endpoint = "https://e"
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self._error = error
+        self.refresh_calls = 0
+        self.probed = 0
+
+    async def refresh(self, data):
+        self.refresh_calls += 1
+        if self._error is not None:
+            raise self._error
+        return {**data, "bearer_token": "NEW", "refresh_token": "RT2",
+                "expires_at": int(time.time()) + 7200}
+
+    async def probe_quota(self, _data):
+        self.probed += 1
+        return Quota(remaining=7, total=10, probed_at=1)
+
+
 @pytest.fixture()
 def batch_app(tmp_path):
     """独立 app + admin 会话 + 桩 provider（批量用例需要直接操作仓库造数据）。"""
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+    settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                        DATA_DIR=str(tmp_path),
                         ADMIN_USERNAMES="root")
     app = build_app(settings)
     app.state.executor._deps.providers["codebuddy"] = _StubProvider()
@@ -58,9 +82,11 @@ def batch_app(tmp_path):
         yield app, client
 
 
-def _add(app, provider: str = "codebuddy") -> str:
+def _add(app, provider: str = "codebuddy",
+         credential_data: dict | None = None) -> str:
     return app.state.credentials.add(provider=provider,
-                                     credential_data={"bearer_token": "t"})
+                                     credential_data=credential_data or
+                                     {"bearer_token": "t"})
 
 
 def test_batch_probe_reports_per_item_results(batch_app):
@@ -279,7 +305,7 @@ def test_batch_audit_failure_does_not_lose_per_item_results(batch_app, monkeypat
 def test_batch_rejects_unknown_action(batch_app):
     _app, client = batch_app
     response = client.post("/api/credentials/batch",
-                           json={"action": "refresh", "ids": ["x"]})
+                           json={"action": "explode", "ids": ["x"]})
     assert response.status_code == 400
     assert "unknown batch action" in response.text
 
@@ -402,7 +428,8 @@ def test_batch_unexpected_exception_is_contained_per_item(batch_app):
 
 def test_batch_rejects_viewer(tmp_path):
     """viewer（非 operator）不能批量写：403。"""
-    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+    settings = Settings(_env_file=None, APP_SECRET=SECRET,
+                        DATA_DIR=str(tmp_path / "viewer"),
                         ADMIN_USERNAMES="root")
     app = build_app(settings)
     with TestClient(app) as client:
@@ -453,3 +480,99 @@ def test_delete_provider_rejects_unknown_provider_and_csrf(batch_app):
     )
     assert rejected.status_code == 403
     assert {row["id"] for row in app.state.credentials.list_all()} == before
+
+
+def test_refresh_endpoint_rotates_token_and_revives(batch_app):
+    """单条手动刷新：强制轮转 RT、解除硬禁用、立即探测并写审计。"""
+    app, client = batch_app
+    provider = _RefreshProvider()
+    app.state.services.registry["codebuddy"] = provider
+    credential_id = _add(app, credential_data={
+        "bearer_token": "old", "refresh_token": "RT1"})
+    app.state.credentials.mark_relogin_required(credential_id, "旧原因")
+
+    response = client.post(f"/api/credentials/{credential_id}/refresh")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True and body["refreshed"] is True
+    assert body["rotated"] is True and body["revived"] is True
+    assert body["expires_at"] > 0
+    stored = app.state.credentials.credential_data(credential_id)
+    assert stored["bearer_token"] == "NEW" and stored["refresh_token"] == "RT2"
+    row = {item["id"]: item for item in app.state.credentials.list_all()}[credential_id]
+    assert row["disabled"] == 0
+    events = app.state.audit.query(action="credential.refresh")
+    assert len(events) == 1 and events[0]["target"] == credential_id
+    assert events[0]["ok"] == 1 and events[0]["detail"] == "刷新成功"
+
+
+def test_refresh_endpoint_reports_terminal_failure_without_500(batch_app):
+    app, client = batch_app
+    app.state.services.registry["codebuddy"] = _RefreshProvider(
+        error=UpstreamReloginRequired("refresh_token=SECRET-LEAK"))
+    credential_id = _add(app, credential_data={
+        "bearer_token": "old", "refresh_token": "RT1"})
+
+    response = client.post(f"/api/credentials/{credential_id}/refresh")
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["error"] == "relogin_required"
+    assert "SECRET-LEAK" not in response.text
+    row = {item["id"]: item for item in app.state.credentials.list_all()}[credential_id]
+    assert row["disabled"] == 1
+    events = app.state.audit.query(action="credential.refresh")
+    assert events[0]["ok"] == 0 and events[0]["detail"] == "relogin_required"
+
+
+def test_refresh_endpoint_rejects_missing_and_viewer(batch_app, tmp_path):
+    _app, client = batch_app
+    assert client.post("/api/credentials/cred_ghost/refresh").status_code == 400
+
+    settings = Settings(_env_file=None, APP_SECRET=SECRET, DATA_DIR=str(tmp_path),
+                        ADMIN_USERNAMES="root")
+    app = build_app(settings)
+    with TestClient(app) as guest:
+        guest.cookies.set("coding2api_session", create_session_token("guest", SECRET))
+        assert guest.post("/api/credentials/cred_1/refresh").status_code == 403
+
+
+def test_batch_refresh_isolates_failures_and_audits(batch_app):
+    app, client = batch_app
+    provider = _RefreshProvider()
+    app.state.services.registry["codebuddy"] = provider
+    credential_id = _add(app, credential_data={
+        "bearer_token": "old", "refresh_token": "RT1"})
+
+    response = client.post("/api/credentials/batch",
+                           json={"action": "refresh",
+                                 "ids": [credential_id, "cred_ghost"]})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["succeeded"] == 1 and body["failed"] == 1
+    by_id = {row["id"]: row for row in body["results"]}
+    assert by_id[credential_id]["ok"] is True
+    assert by_id[credential_id]["detail"]["rotated"] is True
+    assert by_id["cred_ghost"] == {"id": "cred_ghost", "ok": False,
+                                   "error": "credential not found"}
+    assert provider.refresh_calls == 1
+    events = app.state.audit.query(action="credential.refresh")
+    assert len(events) == 1
+    assert events[0]["detail"] == "批量 refresh：1/2 成功"
+
+
+def test_refresh_rejects_csrf(batch_app):
+    app, client = batch_app
+    app.state.services.registry["codebuddy"] = _RefreshProvider()
+    credential_id = _add(app)
+    response = client.post(f"/api/credentials/{credential_id}/refresh",
+                           headers={"Origin": "http://evil.example.com"})
+    assert response.status_code == 403
+    assert app.state.credentials.credential_data(credential_id)["bearer_token"] == "t"
+
+
+def test_refresh_without_backend_callback_is_400(batch_app):
+    app, client = batch_app
+    credential_id = _add(app)
+    app.state.services.refresh_credential = None
+    assert client.post(
+        f"/api/credentials/{credential_id}/refresh").status_code == 400

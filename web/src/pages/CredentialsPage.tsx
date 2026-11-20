@@ -49,7 +49,7 @@ import {
 } from "../lib/credentialList";
 import type { GroupSort, Ledger } from "../lib/credentialList";
 import { api } from "../api/client";
-import { CHECKIN_PROVIDERS } from "../api/providers";
+import { CHECKIN_PROVIDERS, REFRESH_PROVIDERS } from "../api/providers";
 import { useSessionContext } from "../Layout";
 import { useCredentials, usePlaygroundModels, useQueryClient } from "../api/hooks";
 import { PoolOverview } from "../components/PoolOverview";
@@ -97,7 +97,14 @@ import {
   tokenExpiryView,
 } from "../api/display";
 import type { CredentialState, TokenExpiryView } from "../api/display";
-import type { BatchAction, BatchResult, CheckinEvent, Credential, CreditEvent, GrowthRunResult } from "../api/types";
+import type {
+  BatchAction,
+  BatchResult,
+  CheckinEvent,
+  Credential,
+  CreditEvent,
+  GrowthRunResult,
+} from "../api/types";
 import {
   Badge,
   Button,
@@ -130,6 +137,30 @@ function supportsCheckin(provider: string): boolean {
   // 能力清单与后端同源（Zen / Kilo 无签到接口、国际站上游无活动），
   // 集中定义在 `api/providers.ts`，组头汇总与行内按钮共用一份判定。
   return CHECKIN_PROVIDERS.has(provider);
+}
+
+/** 渠道是否有 RT 刷新能力（手工 token 没有 refresh_token 时仍会失败）。 */
+function supportsRefresh(provider: string): boolean {
+  return REFRESH_PROVIDERS.has(provider);
+}
+
+/** 手动 RT 刷新的失败短码 → 用户能据以行动的中文。 */
+function refreshFailureLabel(error: string | undefined): string {
+  switch (error) {
+    case "credential not found":
+      return "凭证不存在（可能已删除）";
+    case "credential has no refresh_token":
+      return "该凭证没有 refresh_token，无法用 RT 刷新；请重新登录导入";
+    case "refresh not supported":
+    case "refresh is not available":
+      return "该渠道或当前服务不支持 RT 刷新";
+    case "relogin_required":
+      return "refresh_token 已失效，必须重新登录";
+    case "credential decryption failed":
+      return "凭证解密失败（APP_SECRET 是否更换过？）";
+    default:
+      return "刷新失败，请查看服务端日志后重试";
+  }
 }
 
 /**
@@ -188,6 +219,9 @@ type BatchButton = {
 const BATCH_BUTTONS: readonly BatchButton[] = [
   { key: "probe", action: "probe", verb: "探测额度", done: "探测完成" },
   { key: "checkin", action: "checkin", verb: "每日签到", done: "签到完成" },
+  // 一次性 RT 由后端 RefreshTask 统一轮转；批量只负责把勾选的 id 发过去。
+  // 放在签到之后、暂停之前：它是「续命」动作，和探测/签到同属日常维护。
+  { key: "refresh", action: "refresh", verb: "RT 刷新", done: "刷新令牌完成" },
   { key: "pause", action: "toggle", enabled: false, verb: "暂停", done: "已暂停" },
   { key: "resume", action: "toggle", enabled: true, verb: "取消暂停", done: "已取消暂停" },
   // 「恢复」= revive（解除 session 死亡硬禁用），与「取消暂停」是两件事；
@@ -251,9 +285,10 @@ function batchRowReason(action: BatchAction, row: BatchResult["results"][number]
     if (row.error === "credential not found") return "凭证不存在（可能已删除）";
     if (row.error === "action_failed") return "执行失败，详见服务端日志";
     if (row.error.startsWith("credential does not support")) return "该渠道不支持此操作";
+    if (action === "refresh") return refreshFailureLabel(row.error);
     return row.error;
   }
-  if (action === "probe" && row.detail && "reason" in row.detail) {
+  if (action === "probe" && row.detail && "probed" in row.detail) {
     return probeFailureLabel(row.detail.reason);
   }
   if (action === "checkin" && row.detail && "message" in row.detail && row.detail.message) {
@@ -332,6 +367,7 @@ function GrowthToastContent({ result }: { result: GrowthRunResult }) {
 interface Actions {
   revive: (credential: Credential) => void;
   forceRevive: (credential: Credential) => void;
+  refreshToken: (credential: Credential) => void;
   toggle: (credential: Credential) => void;
   pin: (credential: Credential) => void;
   remove: (credential: Credential) => void;
@@ -671,6 +707,29 @@ export function CredentialsPage() {
         () => api.reviveCredential(credential.id, true),
         "已强制恢复：上游点名的冷却（限流/余额/权益/风控）也一并清除，请留意可能立刻再撞上游。",
       ),
+    // 用 refresh_token 换新 access token。成功后后端会先落库轮转后的 RT，
+    // 再解除硬禁用；这里只负责播报结果并刷新列表。
+    refreshToken: (credential) =>
+      void (async () => {
+        setBusy(true);
+        try {
+          const result = await api.refreshCredential(credential.id);
+          if (!result.ok) {
+            showError(`RT 刷新失败：${refreshFailureLabel(result.error)}`);
+            return;
+          }
+          const expiry = result.expires_at > 0
+            ? `，新 token 到期 ${formatTime(result.expires_at)}`
+            : "";
+          const revived = result.revived ? "，已解除硬禁用并恢复调度" : "";
+          showNotice(`RT 刷新成功${expiry}${revived}。`);
+          await refresh();
+        } catch (caught) {
+          showError(caught instanceof Error ? caught.message : "RT 刷新失败");
+        } finally {
+          setBusy(false);
+        }
+      })(),
     toggle: (credential) =>
       void run(
         () => api.toggleCredential(credential.id, credential.enabled !== 1),
@@ -2229,6 +2288,14 @@ function Row({
                       </DropdownMenuItem>
                     )}
                     <DropdownMenuSeparator />
+                    {supportsRefresh(credential.provider) && (
+                      <DropdownMenuItem
+                        onSelect={() => actions.refreshToken(credential)}
+                        title="用 refresh_token 立即换新 access token；成功后解除硬禁用与本地冷却"
+                      >
+                        <RefreshCw className="size-4" /> RT 刷新
+                      </DropdownMenuItem>
+                    )}
                     {credential.disabled === 1 && (
                       <DropdownMenuItem onSelect={() => actions.revive(credential)}>
                         <HeartPulse className="size-4" /> 恢复

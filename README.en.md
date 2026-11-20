@@ -232,7 +232,7 @@ Free models at [Kilo](https://kilo.ai) (`api.kilo.ai/api/gateway`), no login. St
 
 **Plugin JSON import**: exported `dpop_private_key` / `cloud_dragon_token` / `code_verifier` / `expiration` fields are accepted directly. The first two normalize to `dpop_private_jwk` / `security_token`, so chat and pre-refresh keep working after import.
 
-**Token refresh is rigid**: refresh_token, `client_id=codearts-agent` and DPoP key are bound and single-use; new refresh_token must be written back. Handled by pre-refresh task (DPoP ES256/P-256). Window capped at 45 minutes and must be wider than polling interval. Revoked credential marked "re-login required", stops automatic retries.
+**Token refresh is rigid**: refresh_token, `client_id=codearts-agent` and DPoP key are bound and single-use; new refresh_token must be written back. Handled by the pre-refresh task (DPoP ES256/P-256), with a 45-minute window cap that must stay wider than the polling interval. Expired or soon-to-expire rows can also be renewed immediately via row menu *RT refresh* or the batch *RT refresh* button; both share the same `RefreshTask` core (edit lock + snapshot dedupe), so a single-use RT is never consumed twice. Revoked credential marked "re-login required", stops automatic retries.
 
 **Daily check-in**: `GET /v1/ops/delivery` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`. The campaign is picked by `type=USER_LOGIN` and **`campaignId` comes from that response** (upstream switched it from 1 to 34 and the reward from 1000 to 100 credits in Nov 2026; hard-coding the id made check-in report success while the web task stayed pending and credits never grew). `CLAIMED` means claimed-but-unconfirmed, so both steps always run. **Re-login merges**: the same upstream account (`uid`) updates its existing credential row (fresh tokens, revival from "re-login required"), keeping paused/pinned/tags/stats attribution; only a different account creates a new row.
 
@@ -479,17 +479,18 @@ No `credential_id` / `api_key_id` / `username` (high cardinality). `requests_tot
 
 ## Credential batch operations
 
-The credentials page offers multi-select plus batch bar (probe / check-in / pause / unpause / revive).
+The credentials page offers multi-select plus batch bar (probe / check-in / RT refresh / pause / unpause / revive).
 
-- **Endpoint**: `POST /api/credentials/batch`, body `{action: "probe"|"toggle"|"checkin"|"revive", ids: [...], enabled?}`. Up to 200 ids, duplicates deduped.
+- **Endpoint**: `POST /api/credentials/batch`, body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh", ids: [...], enabled?}`. Up to 200 ids, duplicates deduped.
+- **Manual RT refresh**: `POST /api/credentials/{id}/refresh` ignores the pre-refresh window and immediately exchanges the refresh_token for a new access token. On success it persists the rotated RT first, then clears the hard-disable / local cooldown and queues a quota probe. The response is `{ok, refreshed, rotated, expires_at, revived, reason?, error?}`; a terminal upstream rejection is `ok=false, error="relogin_required"` (HTTP 200, not 500). Batch `refresh` isolates rows and calls the same implementation, probing each successful row afterwards; both paths write `credential.refresh` audit entries (one summary row for a batch). Row and batch entries only appear for channels with refresh support, while a manually imported token without an RT fails per row with `credential has no refresh_token`.
 - **Batch import**: `POST /api/credentials/batch-import`, body `{items: [{provider, credential, nickname?, tags?}]}`. Up to 100 items; validated one by one, bad entries only land in `failed` (with `index` and reason); identical decrypted content within one channel counts as duplicate → `skipped`. The credentials page's *Batch import* accepts a JSON array / JSONL or a file.
 - **Per-item isolation**: one failure never blocks the rest. Response `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`.
 - **A failed check-in is a result, not a failure**: an upstream refusal (account disabled / session expired / rate limited) returns `ok=false` with a readable `message`, never 500 — otherwise the console only says "check-in failed" and hides the real reason.
 - **Pause is explicit state, not toggle-flip**: `enabled` comes from body → bar has separate *Pause* / *Unpause* buttons.
 - **Revive ≠ unpause**: revive clears system hard-disable (needs re-login first); unpause sets `toggle enabled=true`.
 - **Clear a channel**: `DELETE /api/credentials/provider/{provider}` removes every credential of that channel and returns `{provider, deleted}`; unknown channels are 400, an already-empty channel returns `deleted: 0`. It is a dedicated endpoint rather than a generic batch `delete`: the action is irreversible, the console requires a separate confirmation on the channel header, and one summary `credential.delete` audit row is written.
-- Only actions with existing single-item endpoints: `refresh` and `delete` are excluded.
-- **Audit writes one summary row** (`toggle` / `revive`); audit failure logs warning and does not fail operation.
+- Only actions with existing single-item endpoints: `delete` is excluded.
+- **Audit writes one summary row** (`toggle` / `revive` / `refresh`); audit failure logs warning and does not fail operation.
 
 ## Credential limit guards
 

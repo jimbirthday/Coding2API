@@ -26,6 +26,7 @@ from ..audit.actions import (
     ACTION_CREDENTIAL_LIMITS,
     ACTION_CREDENTIAL_LOGIN_SECRET,
     ACTION_CREDENTIAL_PIN,
+    ACTION_CREDENTIAL_REFRESH,
     ACTION_CREDENTIAL_REVIVE,
     ACTION_CREDENTIAL_SWITCH_ACCOUNT,
     ACTION_CREDENTIAL_TAGS,
@@ -58,13 +59,13 @@ ACCOUNT_SORT_KEYS = {
 }
 
 # 批量端点支持的动作。刻意只收「已有单条端点」的动作：
-# - `refresh`（token 预刷新）没有单条入口，且一次性 refresh_token 由后台任务
-#   按 skew 窗口驱动，批量强刷会白耗票据；
+# - `refresh` 有单条 `POST /api/credentials/{id}/refresh`，与预刷新任务共用
+#   `RefreshTask`（编辑锁 + 快照去重），因此批量强刷不会重复消费一次性 RT；
 # - `delete` 破坏性太强，需要单独的二次确认流，不走通用批量通道。
-BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive"})
+BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive", "refresh"})
 
 # 单次批量的上限：一次点「全部探测」最多打多少个上游。上限存在的原因是
-# 探测/签到都会真的出网，没有上限时前端一个「全选」就能把整池凭证的请求
+# 探测/签到/刷新都会真的出网，没有上限时前端一个「全选」就能把整池凭证的请求
 # 同时排进事件循环。
 BATCH_MAX_IDS = 200
 
@@ -92,12 +93,13 @@ WEIGHT_MAX = 1000
 BATCH_CONCURRENCY = 4
 
 # 批量动作 → 审计动作。探测 / 签到是只读语义（与单条端点一致，不写审计），
-# 只有真正改动凭证状态的 toggle / revive 落一条汇总流水。
+# 只有真正改动凭证状态的 toggle / revive / refresh 落一条汇总流水。
 # 写入本身有兜底：审计落库失败只记 warning，不让整批操作返回 500
 # （逐条结果比留痕更重要，且变更此时已提交生效）。
 BATCH_AUDIT_ACTIONS = {
     "toggle": ACTION_CREDENTIAL_TOGGLE,
     "revive": ACTION_CREDENTIAL_REVIVE,
+    "refresh": ACTION_CREDENTIAL_REFRESH,
 }
 
 
@@ -291,6 +293,17 @@ def create_router(services: Services) -> APIRouter:
                 error or ("credential not found" if capability is None
                           else f"credential does not support {capability}"))
         return provider, data
+
+    async def refresh_for(credential_id: str) -> dict:
+        """手动 RT 刷新单条；返回 TaskRunner/RefreshTask 的稳定结果字典。
+
+        返回而不是抛异常：批量端点需要逐条隔离，单条端点也要能区分「刷新被
+        上游拒绝」与「请求本身非法」。凭证不存在仍由调用方在进入这里前判 400。
+        """
+        refresh = services.refresh_credential
+        if refresh is None:
+            raise InvalidRequest("refresh is not available")
+        return await refresh(credential_id, force=True, revive=True)
 
     @router.get("/api/credentials")
     async def list_credentials(sort: str | None = None, order: str | None = None,
@@ -708,6 +721,41 @@ def create_router(services: Services) -> APIRouter:
                               target=credential_id)
         return {"ok": True}
 
+    @router.post("/api/credentials/{credential_id}/refresh")
+    async def refresh_credential(credential_id: str,
+                                 _csrf: None = Depends(csrf_protected),
+                                 principal=Depends(principal_from_request)):
+        """用 refresh_token 强制换新 access token（手动 RT 刷新）。
+
+        与周期预刷新共用 `RefreshTask`：一次性 RT 的轮转、编辑锁与「先落库
+        再恢复调度」顺序都在那里。成功后清硬禁用与本地冷却，并立即重探测额度；
+        上游明确说 RT 已作废时返回 `ok=false` + `relogin_required`，不把失败
+        包装成 500。
+        """
+        require_operator(principal)
+        if credentials.provider_of(credential_id) is None:
+            raise InvalidRequest("credential not found")
+        outcome = await refresh_for(credential_id)
+        services.audit.record(
+            actor=principal.username,
+            action=ACTION_CREDENTIAL_REFRESH,
+            target=credential_id,
+            detail=("刷新成功" if outcome["ok"] else outcome["error"]),
+            ok=bool(outcome["ok"]),
+        )
+        if outcome["ok"]:
+            logger.info("管理员 %s 手动刷新凭证 %s（RT 轮转=%s，已恢复=%s）",
+                        principal.username, credential_id,
+                        outcome["rotated"], outcome["revived"])
+            schedule_probe(credential_id)
+        else:
+            logger.info("管理员 %s 手动刷新凭证 %s 失败：%s",
+                        principal.username, credential_id, outcome["error"])
+        return {"ok": outcome["ok"], "refreshed": outcome["refreshed"],
+                "rotated": outcome["rotated"], "expires_at": outcome["expires_at"],
+                "revived": outcome["revived"], "reason": outcome["reason"],
+                **({} if outcome["ok"] else {"error": outcome["error"]})}
+
     @router.post("/api/credentials/{credential_id}/probe")
     async def probe_credential(credential_id: str,
                                _csrf: None = Depends(csrf_protected),
@@ -773,7 +821,7 @@ def create_router(services: Services) -> APIRouter:
                     if not credentials.revive(credential_id, force=force_revive):
                         return {"id": credential_id, "ok": False, "error": "credential not found"}
                     return {"id": credential_id, "ok": True}
-                # probe / checkin 会真的出网：在途上限只约束这两类动作。
+                # probe / checkin / refresh 会真的出网：在途上限约束这三类动作。
                 # toggle / revive 是本地 DB 写，无上游压力，不受信号量限制。
                 async with semaphore:
                     if action == "probe":
@@ -782,6 +830,20 @@ def create_router(services: Services) -> APIRouter:
                             credentials, provider, data, credential_id)
                         return {"id": credential_id, "ok": bool(detail["probed"]),
                                 "detail": detail}
+                    if action == "refresh":
+                        outcome = await refresh_for(credential_id)
+                        if not outcome["ok"]:
+                            return {"id": credential_id, "ok": False,
+                                    "error": outcome["error"]}
+                        # 与单条端点一致：先拿到新 access token，再重探额度。
+                        # 探测调度在锁外、只入队不等待，不会延长批量 RT 的占用。
+                        schedule_probe(credential_id)
+                        return {"id": credential_id, "ok": True,
+                                "detail": {"refreshed": outcome["refreshed"],
+                                           "rotated": outcome["rotated"],
+                                           "expires_at": outcome["expires_at"],
+                                           "revived": outcome["revived"],
+                                           "reason": outcome["reason"]}}
                     provider, data = provider_for(credential_id, "checkin")
                     detail = await checkin_credential_once(
                         credentials, provider, data, credential_id, schedule_probe,

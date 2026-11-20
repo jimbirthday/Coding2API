@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from src.db.conn import Database
-from src.db.crypto import CredentialCipher
+from src.db.crypto import CredentialCipher, CredentialDecryptError
 from src.db.migrate import apply_schema
 from src.db.repo import CredentialRepository
 from src.engine.scheduler import ErrorOutcome, ModelCooldown
@@ -230,3 +230,173 @@ def test_refresh_task_refreshes_codebuddy_without_explicit_expiry(tmp_path):
         "SELECT token_expires_at FROM credentials WHERE id = ?",
         (unknown,)).fetchone()[0] == 0
     db.close()
+
+
+async def test_manual_refresh_forces_rotation_and_revives_disabled(repo):
+    """手动 RT 刷新不看到期窗口：轮转 RT、落库新 token 并解除硬禁用。"""
+    credentials, _db = repo
+    now = 1_000_000
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT1", "auth_source": "oauth",
+        "expires_at": now + 999_999})
+    credentials.mark_relogin_required(credential_id, "旧原因")
+
+    class Rotating(ProbeProvider):
+        async def refresh(self, data):
+            self.refresh_calls += 1
+            return {**data, "bearer_token": "NEW", "refresh_token": "RT2",
+                    "expires_at": now + 7200}
+
+    provider = Rotating()
+    task = RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600,
+                       now=lambda: now)
+    outcome = await task.refresh_credential(credential_id, force=True, revive=True)
+    assert outcome["ok"] is True and outcome["refreshed"] is True
+    assert outcome["rotated"] is True and outcome["revived"] is True
+    assert outcome["expires_at"] == now + 7200
+    stored = credentials.credential_data(credential_id)
+    assert stored["bearer_token"] == "NEW" and stored["refresh_token"] == "RT2"
+    row = {item["id"]: item for item in credentials.list_all()}[credential_id]
+    assert row["disabled"] == 0 and row["disabled_reason"] is None
+
+
+async def test_manual_refresh_without_force_skips_when_not_due(repo):
+    credentials, _db = repo
+    now = 1_000_000
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT1", "auth_source": "oauth",
+        "expires_at": now + 999_999})
+    provider = ProbeProvider(refresh_new="NEW")
+    task = RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600,
+                       now=lambda: now)
+    outcome = await task.refresh_credential(credential_id, force=False, revive=False)
+    assert outcome["ok"] is True and outcome["skipped"] is True
+    assert outcome["reason"] == "not_needed"
+    assert provider.refresh_calls == 0
+
+
+async def test_manual_refresh_rejects_missing_or_unsupported_token(repo):
+    credentials, _db = repo
+    missing = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "auth_source": "oauth"})
+    task = RefreshTask(credentials, {"codebuddy": ProbeProvider()}, skew_seconds=3600)
+    outcome = await task.refresh_credential(missing)
+    assert outcome["ok"] is False
+    assert outcome["error"] == "credential has no refresh_token"
+    assert await task.refresh_credential("cred_ghost") == {
+        **task._outcome(ok=False, error="credential not found")}
+
+    class NoRefresh:
+        id = "codebuddy"
+
+    other = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT"})
+    task = RefreshTask(credentials, {"codebuddy": NoRefresh()}, skew_seconds=3600)
+    outcome = await task.refresh_credential(other)
+    assert outcome["ok"] is False and outcome["error"] == "refresh not supported"
+
+
+async def test_manual_refresh_handles_unreadable_or_vanished_credential(repo, monkeypatch):
+    """入口读凭证失败仍是稳定结果：解密坏 / 并发删除都不能冒泡成 500。"""
+    credentials, _db = repo
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT1", "auth_source": "oauth"})
+    task = RefreshTask(credentials, {"codebuddy": ProbeProvider()}, skew_seconds=3600)
+
+    def unreadable(_credential_id: str):
+        raise CredentialDecryptError("bad ciphertext")
+
+    monkeypatch.setattr(credentials, "credential_data", unreadable)
+    assert await task.refresh_credential(credential_id) == task._outcome(
+        ok=False, error="credential decryption failed")
+
+    monkeypatch.setattr(credentials, "credential_data", lambda _credential_id: None)
+    assert await task.refresh_credential(credential_id) == task._outcome(
+        ok=False, error="credential not found")
+
+
+async def test_manual_refresh_serializes_concurrent_callers(repo):
+    """两个并发手动刷新只允许消费一次一次性 RT。"""
+    credentials, _db = repo
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT1", "auth_source": "oauth",
+        "expires_at": 1})
+
+    class Slow(ProbeProvider):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def refresh(self, data):
+            self.refresh_calls += 1
+            self.started.set()
+            await self.release.wait()
+            return {**data, "bearer_token": "NEW", "refresh_token": "RT2"}
+
+    provider = Slow()
+    task = RefreshTask(credentials, {"codebuddy": provider}, skew_seconds=3600,
+                       now=lambda: 1)
+    first = asyncio.create_task(task.refresh_credential(credential_id))
+    await provider.started.wait()
+    second = asyncio.create_task(task.refresh_credential(credential_id))
+    # 第二个调用必须先完成锁前快照读取，才会挂到编辑锁上；等到 waiter 出现
+    # 再放行第一个，避免「先放行、第二个才读到新快照」的竞态测试。
+    lock = credentials.edit_lock(credential_id)
+    for _ in range(100):
+        if lock.locked() and lock._waiters:
+            break
+        await asyncio.sleep(0)
+    provider.release.set()
+    first_outcome, second_outcome = await asyncio.gather(first, second)
+    assert first_outcome["refreshed"] is True
+    assert second_outcome["ok"] is True and second_outcome["refreshed"] is False
+    assert second_outcome["reason"] == "already_refreshed"
+    assert provider.refresh_calls == 1
+    assert credentials.credential_data(credential_id)["refresh_token"] == "RT2"
+
+
+async def test_manual_refresh_reports_terminal_and_generic_failures(repo):
+    credentials, _db = repo
+    credential_id = credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT1", "auth_source": "oauth",
+        "expires_at": 1})
+
+    class Dead(ProbeProvider):
+        async def refresh(self, _data):
+            self.refresh_calls += 1
+            raise UpstreamReloginRequired("refresh_token=SECRET-LEAK")
+
+    task = RefreshTask(credentials, {"codebuddy": Dead()}, skew_seconds=3600,
+                       now=lambda: 1)
+    outcome = await task.refresh_credential(credential_id)
+    assert outcome["ok"] is False and outcome["error"] == "relogin_required"
+    row = {item["id"]: item for item in credentials.list_all()}[credential_id]
+    assert row["disabled"] == 1 and "SECRET-LEAK" not in row["disabled_reason"]
+
+    credentials.revive(credential_id)
+    class Boom(ProbeProvider):
+        async def refresh(self, _data):
+            self.refresh_calls += 1
+            raise RuntimeError("upstream body with secret")
+
+    task = RefreshTask(credentials, {"codebuddy": Boom()}, skew_seconds=3600,
+                       now=lambda: 1)
+    outcome = await task.refresh_credential(credential_id)
+    assert outcome == task._outcome(attempted=True, ok=False, error="refresh_failed")
+
+
+async def test_periodic_refresh_skips_unsupported_provider(repo):
+    """周期任务遇到没有 refresh 能力的渠道记 skipped，不算失败。"""
+    credentials, _db = repo
+    credentials.add(provider="codebuddy", credential_data={
+        "bearer_token": "old", "refresh_token": "RT", "auth_source": "oauth",
+        "expires_at": 1})
+
+    class NoRefresh:
+        id = "codebuddy"
+
+    task = RefreshTask(credentials, {"codebuddy": NoRefresh()}, skew_seconds=3600,
+                       now=lambda: 1)
+    report = await task.run_once()
+    assert report.skipped == 1 and report.failed == 0
