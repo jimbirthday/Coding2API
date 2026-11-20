@@ -276,6 +276,11 @@ export const api = {
     }
     return { blob: await response.blob() };
   },
+  exportCodeArts: (ids?: string[]) =>
+    request<Record<string, unknown>[]>("/api/credentials/codearts/export", {
+      method: "POST",
+      ...json(ids === undefined ? {} : { ids }),
+    }),
   // ---------------------------------------------------------------- 备份
   backups: () => request<BackupListResponse>("/api/backups"),
   createBackup: () =>

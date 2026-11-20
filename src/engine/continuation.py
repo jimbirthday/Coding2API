@@ -81,12 +81,14 @@ class ContinuationStream:
     """
 
     def __init__(self, provider: Any, credential_data: dict[str, Any],
-                 payload: dict[str, Any], model: str, *, max_continues: int) -> None:
+                 payload: dict[str, Any], model: str, *, max_continues: int,
+                 initial_stream: AsyncIterator[Event] | None = None) -> None:
         self._provider = provider
         self._credential_data = credential_data
         self._payload = payload
         self._model = model
         self._max_continues = max_continues
+        self._initial_stream = initial_stream
         self.continues_done = 0
 
     async def __aiter__(self) -> AsyncIterator[Event]:
@@ -94,9 +96,12 @@ class ContinuationStream:
         reasoning_parts: list[str] = []
         usage = Usage()
         finish_reason: str | None = None
+        permit = None
 
-        source = self._provider.stream_chat(
-            self._credential_data, self._payload, self._model)
+        source = self._initial_stream
+        if source is None:
+            source = self._provider.stream_chat(
+                self._credential_data, self._payload, self._model)
         # finally 覆盖「本生成器被提前关闭」的所有路径（executor 遇到流内错误
         # break、换号重试、客户端断开）：`async for` 不会替我们关闭 source，
         # 而 provider 的节流名额在它自己的 finally 里归还，不显式关闭就会
@@ -124,7 +129,6 @@ class ContinuationStream:
                     yield Event(kind=EventKind.FINISH, finish_reason=finish_reason)
                     return
 
-                self.continues_done += 1
                 # 每轮结束先把**已完成轮次**的累计用量汇报一次（USAGE 事件不单独
                 # 成帧，只落进 translator.usage）：下一轮若客户端中途断开，记账
                 # 仍能拿到已跑完的用量，而不是退化成 0。
@@ -133,10 +137,26 @@ class ContinuationStream:
                 self._payload = extend_payload(
                     self._payload, "".join(content_parts), "".join(reasoning_parts))
                 content_parts, reasoning_parts = [], []
+                options = {}
+                bucket_for = getattr(self._provider, "chat_bucket", None)
+                if bucket_for is not None:
+                    bucket = bucket_for(self._credential_data)
+                    if bucket is not None:
+                        pacer, key = bucket
+                        permit = pacer.try_reserve(key)
+                        if permit is None:
+                            yield Event(kind=EventKind.FINISH, finish_reason=finish_reason)
+                            return
+                        options["permit"] = permit
+                self.continues_done += 1
                 source = self._provider.stream_chat(
-                    self._credential_data, self._payload, self._model)
+                    self._credential_data, self._payload, self._model, **options)
         finally:
-            await aclose_stream(source)
+            try:
+                await aclose_stream(source)
+            finally:
+                if permit is not None:
+                    permit.close()
 
 
 def _add_usage(total: Usage, part: Usage | None) -> Usage:

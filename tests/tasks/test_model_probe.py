@@ -253,6 +253,34 @@ async def test_empty_stream_is_inconclusive(repo):
     assert _probes(db).get("codebuddy", "m")["last_error"] == "上游未返回任何内容"
 
 
+@pytest.mark.parametrize("kind", [EventKind.CONTENT, EventKind.ERROR])
+async def test_codearts_probe_releases_chat_slot_on_early_return(repo, kind):
+    from src.provider.codearts import CodeArtsProvider, credential_key
+    from src.provider.codearts.credential import CodeArtsCredential
+    from src.tasks.pacer import Pacer
+
+    class Client:
+        closed = False
+
+        async def stream_chat(self, credential, payload, model):
+            try:
+                yield Event(kind, content="ok", error_kind=ErrKind.SOFT)
+            finally:
+                self.closed = True
+
+    credentials, db = repo
+    pacer = Pacer(0, 0, allow_concurrent=True, max_concurrency=2)
+    client = Client()
+    provider = CodeArtsProvider(client=client, pacer=pacer)
+    task = ModelProbeTask(credentials, {"codearts": provider}, _probes(db))
+    data = {"uid": "test-account", "access_key_id": "dummy", "secret_access_key": "dummy"}
+    result = await task._probe_one(provider, data, "m")
+    assert result[0] == ("ok" if kind is EventKind.CONTENT else "inconclusive")
+    assert client.closed
+    assert pacer._inflight == {}
+    assert pacer.ready_in(credential_key(CodeArtsCredential.from_dict(data))) == 0
+
+
 # ------------------------------------------------------------------ 目标选择
 
 async def test_only_blocked_reason_is_probed(repo):

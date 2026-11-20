@@ -235,7 +235,7 @@ async def test_stream_done_disconnect_without_credential(monkeypatch):
         providers={"trae": Provider()}, credentials=Creds(),
         scheduler=_Scheduler(), stats=_Collector(recorded)))
     async def _no_pick(target, tried, affinity_id=None):
-        return None, None
+        return None, None, None
 
     monkeypatch.setattr(executor, "_pick", _no_pick)
 

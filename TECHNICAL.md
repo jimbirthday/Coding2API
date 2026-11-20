@@ -209,6 +209,8 @@ def health_score(q: Quota | None) -> int | None:
 ### 3.4 截断续写
 `finish_reason == "length"` → 同凭证续写，最多 `AUTO_CONTINUE_MAX`（默认 10，0 关闭）。实现 `engine/continuation.py::ContinuationStream`：追加「已产出正文 + 续写指令」重发；输出上限两键归零；跨轮累计 usage；末端补一条累计 usage + 最后一轮真实 `finish_reason`（上游未报 usage 不补，避免误报 0）。事件流包装器而非 executor 重跑：凭证固定 → 轮换 / 记账 / 统计零改动。
 
+CodeArts 已输出后的每轮自动续写通过 `try_reserve` 尝试同账号原子准入，不能立即启动时保留原 `finish_reason=length` 正常截断收尾，避免阻塞在 provider 本地 pacer 被误判为上游空闲超时；首轮请求与固定原号重试仍分别使用全池/同账号有界等待（§6.6）。
+
 只做 `length` 一个判据：「仅 reasoning 无正文」只在客户端下发 `max_tokens` 时出现，本网关不做 max 键映射 → 不可达；「空正文」「代码块未闭合」无证据 → 不做。
 
 **输出上限键**：CB 忽略 `max_completion_tokens`、只认 `max_tokens`（精确截断 + `length`）；两键同发后者胜。TRAE 两键都不生效。`enable_thinking:false` 亦被 CB 忽略。
@@ -493,7 +495,9 @@ class Provider(Protocol):
 
 **一次性票终态**：`client.refresh_token` 捕获 `TokenEndpointError` 后经 `events.relogin_required(body)` 判定，只认 `_RELOGIN_MARKERS`（`STS5.1806 the refresh token has been used` / `invalid client id` / `InvalidDPoPHeader` / `invalid_grant`）。网络 / 5xx / 限流 / 普通 4xx 仍可重试（误判会让偶发故障永久废掉好凭证）。`RefreshTask` 捕获后 `mark_relogin_required`：写可操作 `disabled_reason`、硬禁用、清模型级冷却。
 
-**并发上限与滑动窗口**：上游每账号每约 60s 最多 3 个会话；超出 `HTTP 400` + `TM.00001041 并发会话数已达上限(3个)`（会话在 HTTP 结束后仍滞留，实测约 68s 恢复）。`Pacer` 按桶在途上限 `max_concurrency`（满则挂起等 `release`）+ 滑动窗口 `window_seconds`（同桶最近 N 秒最多放行 M 次）。装配 `lambda: runtime.codearts_max_concurrency`（默认 3）与 `lambda: runtime.codearts_request_window_seconds`（默认 60s，`0` 关闭窗口）。窗口模式配 `max_concurrency=0` 不生效。
+**并发上限与滑动窗口**：上游每账号每约 60s 最多 3 个会话；超出 `HTTP 400` + `TM.00001041 并发会话数已达上限(3个)`（会话在 HTTP 结束后仍滞留，实测约 68s 恢复）。`Pacer` 按桶在途上限 `max_concurrency` + 滑动窗口 `window_seconds`（同桶最近 N 秒最多放行 M 次）。装配 `lambda: runtime.codearts_max_concurrency`（默认 3）与 `lambda: runtime.codearts_request_window_seconds`（默认 60s，`0` 关闭窗口），均可热更。例如设置 `max_concurrency=2`、`window_seconds=60` 时，既限制两次在途，也限制每账号每 60s 最多启动两次；流结束不清已消耗的窗口配额。窗口模式配 `max_concurrency=0` 不生效。
+
+**账号桶与 permit**：`CodeArtsProvider.chat_bucket` 暴露同一聊天 pacer 与 `credential_key`（`stable_key("codearts", uid or access_key_id)`），同 `uid` 的多条凭证共享在途及窗口容量。executor 同步检查 `ready_in`、选号、`try_reserve`，同一事件循环内无 `await`，避免并发请求争用时超额放行；预占的 `PacerPermit` 随首轮流传入 provider，自动续写的首轮也复用该流，后续续写仅尝试同账号立即准入（§3.4）。准备失败或启动前取消时 `close()` 幂等释放名额并回滚未提交的窗口启动记录；provider 的 `paced(..., permit=...)` 提交后，关流只释放在途名额，已提交的窗口配额保留至到期。准入与计数均为进程内状态，多进程不共享。
 
 **名额归还须显式关流**：`async for ... break` 不关闭 async generator（只在耗尽 / `aclose()` / GC 时跑 `finally`）。executor 遇 `ERROR` 的 `break` 让名额推迟归还 → `_inflight` 单调累积 → 表现「用了三次就限制」。故 `provider.base.aclose_stream` 统一关闭；`stream_guarded` / `stream` / `_stream_loop` / `complete` / `ContinuationStream.__aiter__` 五处提前结束处全部显式关闭。
 
@@ -592,7 +596,7 @@ class Scheduler:
 
 **管理员权重**（`credentials.routing_weight`，`-1000..1000`，NULL/0 = 默认）不参与上表的键比较，而是在排完序后再做一次**同健康档内的稳定重排**：取当前第一名所在的 `_rank` 档，档内按 `-weight` 重排，再接回其余档。因此权重能压过免费优先 / 在途 / 到期额度，但永远不能把 exhausted 或 unknown 的号越过 known 档（权重是偏好，不是准入条件）；全 0 时排序与补列前逐字节一致。
 
-**手动 pin 优先**：有 `pinned` → 只在 pinned 间排序。到期积分只算一处 `expiring_credits()`：选号走 `Candidate.expiry_credits()`；列表走 `GET /api/credentials` 的 `quota_expiring_credits` / `_secondary`；共用 `expiry_windows()`。无到期信息 → `null`；窗口关闭或确无临近过期 → `0`（均不显示）。
+**手动 pin 优先**：容量过滤后的可启动候选有 `pinned` → 只在这些 pinned 间排序；满额 pin 不阻挡其他可启动账号。到期积分只算一处 `expiring_credits()`：选号走 `Candidate.expiry_credits()`；列表走 `GET /api/credentials` 的 `quota_expiring_credits` / `_secondary`；共用 `expiry_windows()`。无到期信息 → `null`；窗口关闭或确无临近过期 → `0`（均不显示）。
 
 > **TRAE 也落 `quota_expiry_ladder`**（权益包各自独立到期），两列同时填，口径「未过期 + 有余额」。`quota_cycle_end` 仍 `NULL`（各包未必共享重置点）。
 
@@ -605,7 +609,7 @@ class Scheduler:
 `credential_model_cooldowns(credential_id, model, cooling_until, hits, reason)` 按 **(凭证, 模型)** 建表——账号级 `cooling_until` 放不下「同账号其他模型仍可用」。`model_probes(...)` 是**观测记录**：冷却表为调度权威（真实失败驱动）；探活表只供展示（探测失败未必是模型问题）。
 
 - 登记名 = **该凭证所属上游的原始模型名**（`_upstream_model`）；CB 与 TRAE 大小写变体不同，归一名漏判。
-- 选号路径：`executor._select` 逐凭证过滤 `is_selectable(now, 模型名)` + 注入 `Candidate.credit_rate` → 交 `Scheduler.select`；同时完成收窄、粘性命中与排序（`_sticky(...) or scheduler.select(...)`）。
+- 选号路径：`executor._select` 逐凭证过滤 `is_selectable(now, 模型名)` + 注入 `Candidate.credit_rate` → CodeArts 聊天容量过滤 → `_choose` 内粘性命中或 `Scheduler.select` 排序（`_sticky(...) or scheduler.select(...)`）。粘性号可启动时优先复用（可启动 pin 仍优先）；满额时可迁到其他可启动账号。
 - **冷却到期先半开**（`engine/half_open.py`，`(凭证, 作用域)` 粒度；作用域空串 = 账号级、非空 = 该模型）：到期后只放行**一个**探测请求，其余请求见占用即换号（唯一候选时按无可用返回）。成功记「已探通」120s 期内直放；失败由上游写新冷却、探测位立刻释放。探测位 TTL 600s 兜 GC 泄漏。理由：到期即全量回池会把刚解冻的号再打进限流（锯齿）。进程内集合，重启只让每个号多探一次。
 - 退避：`MODEL` 10m 起翻倍封顶 2h；`BLOCKED` 6h 起翻倍封顶 24h；`CONCURRENCY` 首枪 60s，**同一条命中链**才翻倍，封顶按渠道分档：默认 5min（CodeArts 一类「在途排空即恢复」的并发上限），`CONCURRENCY_LONG_WINDOW_PROVIDERS`（raccoon）30min。换 reason 重新计数。命中链 = 上一次 (凭证, 模型) 并发冷却到期后 240s 内又被打满（首枪冷却 60s，等价于相邻命中间隔 ≤300s）：说明上游窗口还没恢复，继续 60s 重 armed 只是白撞（raccoon 实测 2026-11-15：125 次 `user_model_rate_limited`、相邻间隔 122 个——≤150s 38 个、151–300s 41 个、>300s 43 个）。中间成功过或空闲久了即新的一轮，hits 归 1。**长窗口渠道为什么单独一档**：raccoon 的 429 不是「在途满了」而是账号×模型的频率窗口——三凭证闲置 28 分钟后首个请求仍全部 429；156 次 429 到同凭证下次成功的间隔中位数 1522s、75% 分位 2530s，22/156 才在 5min 内恢复。5min 封顶等于每 5min 白撞一波（一波三号 = 3 次）。**整组打满**：同 (provider, model) 在 90s 窗口内被第二个不同凭证再命中（raccoon 实测 14 波三凭证同秒 429）→ 直接升该渠道封顶档，别让剩余号逐个白撞；检测状态在进程内，重启即清（429 是瞬态）。
 - **上游点名恢复时刻优先**：`Retry-After` → `parse_retry_after`；头缺失时 CB 走 `parse_reset_at` 读正文 `reset at … UTC+8`（`retry_hints(headers, body=raw)`，仅 CodeBuddy 传 body）。两者经 `clamp_retry_at` 钳在 `[now + 常量, now + 24h]` → `MODEL` 的 600s 只是下限，上游说 22:34 恢复即冷却到 22:34。日志按 `_scope_label` 打作用域：模型级「模型 <名>」，账号级「作用域 账号」——账号级分类的调用方同样传模型名，一律打 `模型` 会让 zen 429 读起来像模型级限流。
@@ -647,6 +651,8 @@ class Scheduler:
 - **挂钩点**：`_selectable` 在 `is_selectable` / 限额之后过滤；`_stream_loop` 与 `_complete_model` 创建上游迭代器后 `_lease`，`finally` 里 `_release`。全满时与限额同口径 `no_healthy_credential`。
 - **与 pacer `max_concurrency` 的区别**：pacer 桶按渠道分、只覆盖走 pacer 的渠道；这里是**跨渠道的凭证级**上限，与渠道节流正交。
 
+**CodeArts 容量等待**：`_pick` 在 sticky/pin 前按 `chat_bucket` / `ready_in` 过滤；只在合格候选全因容量阻塞时启动每次 `_pick` 调用的 `CHAT_CAPACITY_WAIT_SECONDS=60` 等待预算，期间不占 executor 租约、不消耗换号次数。按最早窗口/间隔到期、剩余预算与 1 秒复查上限等待，`release` 可提前唤醒；每轮重新收窄并扫描全池，因此名额释放、窗口到期、配置热更都能触发重选。排队及其他固定原号重试传 `only=credential_id`，容量准入只重查原账号。预算耗尽时 `_pick` 返回 `None`，由调用方处理；此等待与「短冷却只等一轮」分开。
+
 ## 7. 请求时序（chat completions 主链路）
 > 可视化：[`diagrams/coding2api-request-sequence.html`](diagrams/coding2api-request-sequence.html)。`POST /v1/responses` 同链路：先映射成 `ChatRequest`，其后全一致，出口形状由 translator 决定。
 
@@ -658,13 +664,12 @@ class Scheduler:
   3. 选号（executor._select → scheduler.select）：
      a. 候选 = 模型目录能证明归属时收窄到登记了该模型的渠道（_narrow_providers）；
         收窄后若没有任何可用凭证 → 直接判「无可用凭证」出 503（候选只信模型目录）
-     b. 模型级冷却过滤：逐凭证按自己所属上游的原始模型名查 (凭证, 模型) 冷却表
-     c. 会话粘性：存在可选的 pinned 凭证时跳过（pin 优先），否则粘性命中且仍可选的
-        凭证直接复用、不参与排序
-     d. 过滤 healthy（enabled=1, disabled=0, 非冷却中）。enabled=0 只作用于本条对话
-        路径：后台任务只检查 disabled
-     e. 免费优先档 → 到期额度两级排序 → 健康度三态 → 账户剩余积分 → credential_id
-  4. executor：解密凭证 → 按实际渠道压缩上下文 → provider.stream_chat()（≤ AUTO_CONTINUE_MAX 续写）
+     b. 过滤启停/健康、限额与在途租约；逐凭证按上游原始模型名查 (凭证, 模型) 冷却表
+     c. CodeArts 容量过滤在 sticky/pin 前；全池因容量阻塞最多等 60s，不占 executor 租约
+        可启动 pin 优先，否则复用可启动粘性号；满额则选其他可启动账号，固定原号重试除外
+     d. 免费优先档 → 到期额度两级排序 → 健康度三态 → 账户剩余积分 → credential_id
+     e. CodeArts 同步预占 permit，选号至预占之间不 await；未使用的名额可回滚
+  4. executor：解密后的凭证 → 按实际渠道压缩上下文 → provider.stream_chat()（≤ AUTO_CONTINUE_MAX 续写）
      - 上游 HTTP ≥400 → classify → scheduler.note_error → tried 加入 → 回到 3（最多 3 次）
      - 流内 Event.ERROR → 同上映射 → 注入出口错误帧 + 冷却 + 轮换
      - 上游 400（INVALID，如模型不存在）不冷却凭证，跳过该上游全部凭证；
@@ -819,6 +824,7 @@ PRAGMA foreign_keys = ON;      -- 库里没有任何外键：users ↔ api_keys 
 - **分组表合并列**：`请求`（数 · 成功率）、`Token`（输入/输出 · 命中率）、`速度`（正文/总产出）、`平均延迟`（耗时/首字）、`P95 延迟`，14 → 8 列。排序走 `SortMenuHead`，子列键即 `GROUP_SORT_COLUMNS` 白名单键；延迟拆两列（均值读小时汇总、P95 读明细，口径与覆盖期不同）。
 - **明细合并列**：`Token` / `延迟` / `速度` / `渠道 / 凭证`，15 → 约 10 列。`时间` 拆两行（`HH:mm:ss` 在上、日期在下），请求 ID 提示挂该格。`SortMenuHead` 让一个列头承载多个排序键。命中率走 `EVENT_SORT_COLUMNS["cache_rate"]`：`CASE WHEN e.input_tokens > 0 THEN CAST(e.cached_tokens AS REAL) / e.input_tokens ELSE NULL END`；速度两列由 `_row_speed_sql("e.")` 生成，与 `events()` 的 SELECT **同一片段**。
 - **请求 ID**：`X-Request-ID`（`webapp/request_id.py` 最外层）。入站合法（`[A-Za-z0-9._:-]{1,128}`）沿用，否则 `uuid4().hex`；同一中间件把会话标识头写进 contextvar 供粘性读取；ID 经 `request_context` 传进 `usage_events.request_id`。**不透传上游**。
+- **CodeArts 耗时日志**：executor 在容量等待结束/超时时记录 `capacity_wait_ms`；provider 记录 `throttle_wait_ms`（进入 provider 至获准启动）、`upstream_first_ms`（启动至首个上游事件）、`generation_ms`（首事件至关流结束），无上游事件时后两项为 `None`。日志通过上下文的 `request_id` 关联；provider 节流耗时不包含 executor 的容量等待。
 - **失败归因**（`GET /api/stats/errors`，operator+）：按 `(渠道, 模型, 错误类型)` 聚合窗口内 `ok=0` 明细。`failures` 是**尝试**口径（每次上游拒绝一行）；`rescued` = 同用户同 `request_id` 另有成功行的行数（不叠加时间窗，走 `idx_usage_request`）；`failures − rescued` = 未被救回的失败尝试数（同一请求多次失败算多次）。DEAD（硬禁用）额外落一行 `credential_unavailable`（额度耗尽证据成立的 DEAD 例外降级为 `CREDIT`，不落该归因）；11140 风控落 `account_restricted`（见 §3.2）；轮换耗尽时不再重复落收尾行，避免 `requests` 与 Key 日额度双计。
 - **延迟均值只算成功请求**（`SUM(latency_ms WHERE ok=1)` / `ok_count`）。
 - **图表时序指标**（`timeline` / `model-timeline`）：`METRIC_KINDS` 一张表定语义，查询侧固定取齐 10 列聚合（`_METRIC_AGGREGATES`），由 `_metric_value(metric, row)` 归一。派生指标**在聚合后相除**（成功率 `ok_count/requests`、缓存命中率 `cached/input`、单请求成本 `cost/requests`），不是逐小时比率平均——后者被低量小时等权带偏。无样本一律 `null` 而非 0（均值 0 会画成「0 ms」假低谷，比率 0 会显示「0%」）。

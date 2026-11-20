@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -70,7 +71,8 @@ def stable_key(provider: str, identity: str | None) -> str:
 
 
 @asynccontextmanager
-async def paced(pacer: Pacer | None, key: str | None = None) -> AsyncIterator[None]:
+async def paced(pacer: Pacer | None, key: str | None = None,
+                *, permit: PacerPermit | None = None) -> AsyncIterator[None]:
     """`wait_turn` + `finally release` 的配对封装（7 个渠道共用）。
 
     provider 的 `stream_chat` 都要「取名额 → 消费上游流 → 归还」，手写时最容易
@@ -81,6 +83,13 @@ async def paced(pacer: Pacer | None, key: str | None = None) -> AsyncIterator[No
     做成模块级函数而不是 `Pacer` 的方法：测试替身只需实现 `wait_turn` /
     `release` 两个既有接口，不必跟着实现新方法。
     """
+    if permit is not None:
+        permit.commit()
+        try:
+            yield
+        finally:
+            permit.close()
+        return
     if pacer is None:
         yield
         return
@@ -131,6 +140,43 @@ class Pacer:
         self._starts: dict[str, list[float]] = {}
         # 并发模式 + 上限：名额让出时置位，挂起的请求醒来重查是否有空位
         self._wake = asyncio.Event()
+
+    def ready_in(self, key: str) -> float:
+        """距可立即启动的秒数；在途满返回 inf，等待 release 唤醒。"""
+        low, high = self._validate()
+        now = self._now()
+        limit = self.max_concurrency
+        active = self._inflight.get(key, 0)
+        if limit and active >= limit:
+            return math.inf
+        self._prune_starts(key, now)
+        starts = self._starts.get(key, [])
+        if self._windowed() and len(starts) >= limit:
+            return max(0.0, starts[-limit] + self.window_seconds - now)
+        started = self._bucket_started.get(key)
+        if active or started is None:
+            return 0.0
+        interval = low * (1 + JITTER_RATIO) if low == high else high
+        return max(0.0, started + interval - now)
+
+    def try_reserve(self, key: str) -> PacerPermit | None:
+        """同一事件循环内同步预占，选号与占位之间不让出执行权。"""
+        if self.ready_in(key) > 0:
+            return None
+        started = None
+        if self._windowed():
+            started = self._now()
+            self._starts.setdefault(key, []).append(started)
+        self._inflight[key] = self._inflight.get(key, 0) + 1
+        return PacerPermit(self, key, started)
+
+    async def wait_for_change(self, timeout: float) -> None:
+        self._wake.clear()
+        try:
+            async with asyncio.timeout(timeout):
+                await self._wake.wait()
+        except TimeoutError:
+            pass
 
     def _validate(self) -> tuple[float, float]:
         low, high = self.min_seconds, self.max_seconds
@@ -314,5 +360,30 @@ class Pacer:
         else:
             return                            # 多余释放：不虚增名额
         self._wake.set()                      # 唤醒可能正等这个名额的请求
+
+
+class PacerPermit:
+    """预占的单次聊天名额；上游启动前取消会归还窗口配额。"""
+
+    def __init__(self, pacer: Pacer, key: str, started: float | None) -> None:
+        self.pacer = pacer
+        self.key = key
+        self.started = started
+        self.committed = False
+        self.closed = False
+
+    def commit(self) -> None:
+        self.committed = True
+        self.pacer._bucket_started[self.key] = self.pacer._now()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.started is not None and not self.committed:
+            starts = self.pacer._starts.get(self.key, [])
+            if self.started in starts:
+                starts.remove(self.started)
+        self.pacer.release(self.key)
 
 

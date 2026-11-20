@@ -41,6 +41,7 @@ from ..provider.base import (
 )
 from ..provider.naming import normalize_model_key
 from ..request_context import credential_scope, set_credential_id
+from ..tasks.pacer import Pacer, PacerPermit
 from . import privacy
 from .continuation import ContinuationStream
 from .model_resolver import (
@@ -58,6 +59,16 @@ from .reasoning import (
 from .scheduler import Candidate, Scheduler
 
 logger = logging.getLogger(__name__)
+
+CHAT_CAPACITY_WAIT_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class _ChatCapacity:
+    data: dict[str, Any]
+    pacer: Pacer
+    key: str
+    delay: float
 
 # 用量对账：正文少于该字符数不判定（短回复的 token/字符比噪声极大）
 USAGE_MIN_CHARS = 200
@@ -260,8 +271,7 @@ class ExecutorDeps:
     # 的模型，注入时按实测均值覆盖——否则一条过期的目录数据就会让该渠道
     # 永远占住免费档，压过所有到期积分。None = 不校准（测试与旧装配兼容）。
     paid_models: Callable[[], dict[tuple[str, str], float]] | None = None
-    # 会话粘性（ConversationAffinity）；None 表示关闭。对话进行中固定用原
-    # 凭证，出错才轮换，成功后重新粘定实际服务的凭证
+    # 会话粘性（ConversationAffinity）；CodeArts 容量满时允许迁移，成功后重新绑定。
     affinity: Any | None = None
     # 截断续写上限：上游 finish_reason=length 时同凭证续写，最多该次数；
     # 0 关闭。续写在事件流包装器内完成，不参与凭证轮换
@@ -752,7 +762,7 @@ class Executor:
 
         # 排队重开（F3）：上游回「排队中 + retryAfterSeconds」时，等它点名的
         # 秒数后在**原号**上重开，不冷却、不换号、不占轮换预算。
-        # `pinned` 是被点名的凭证（下一轮跳过 `_pick` 直接用），
+        # `pinned` 是被点名的凭证（下一轮仅对该账号重新申请容量），
         # `queued_wait` 是本轮要等的秒数（等完 `continue`）。
         queue_rounds = 0
         pinned: tuple[str, dict[str, Any]] | None = None
@@ -769,14 +779,17 @@ class Executor:
 
         while True:
             if pinned is not None:
-                # 排队重开：复用被点名的凭证，不走 `_pick`（否则可能选到别的号，
-                # 排队语义就丢了）。凭证可能已被并发删除，删了就退回正常选号。
+                # 排队重开只在被点名的账号重新申请容量，删除后退回正常选号。
                 # **不计入 attempts**：排队不是一次「换号尝试」，吃掉轮换预算
                 # 会让三次排队就把整个请求打成 503。
                 credential_id, credential_data = pinned
                 pinned = None
                 if self._safe_credential_data(credential_id) is None:
                     continue
+                pick = await self._pick(target, set(), credential_id, only=credential_id)
+                if pick is None:
+                    continue
+                credential_id, credential_data, permit = pick
                 provider_id = self._deps.credentials.provider_of(credential_id)
                 state.provider, state.credential_id = provider_id or "-", credential_id
             else:
@@ -803,30 +816,21 @@ class Executor:
                     raise _ModelExhausted(
                         self._unavailable_text(target, last_error),
                         "no_healthy_credential")
-                credential_id, credential_data = pick
+                credential_id, credential_data, permit = pick
                 provider_id = self._deps.credentials.provider_of(credential_id)
                 state.provider, state.credential_id = provider_id or "-", credential_id
                 tried.add(credential_id)
                 attempts += 1
             # 按实际服务渠道压缩（未启用/未知窗口/未超限时原样返回）：窗口
             # 取该渠道自己的上限，不再被更小窗口的兄弟渠道拖累误裁
-            payload = self._compress_payload(request, provider_id, target.model)
-            # 档位映射放在选号之后：目标档位依赖**实际服务渠道**（同名模型
-            # 跨渠道接受的档位不同）。返回值可能是新 dict，不改 `request.raw`
-            payload = self._map_effort(provider_id, payload)
-            payload = self._clamp_effort(payload, effort_cap)
-            payload = self._redact_payload(payload, provider_id)
-            # 前缀诊断报告压缩后的载荷（见 _debug_prefix）：压缩每轮裁一条
-            # 就会让上游只能命中 system 段，这里记录的就是上游实际看到的前缀
-            self._debug_prefix(credential_id, provider_id, target.model, payload)
             # 显式持有迭代器并在 finally 里关闭：下面两处 `break`（流内错误）
             # 只跳出 `async for`，不会关闭上游 async generator，provider 的
             # 节流名额归还（pacer.release 在其 finally 里）会推迟到 GC。
             # 轮换重试每次都要重新 wait_turn，泄漏累积到 max_concurrency 后
             # 新请求永久阻塞——「用了三次就限制」。见 aclose_stream 注释。
-            iterator = self._stream_source(
-                provider_id, credential_data, payload, target.model,
-                credential_id).__aiter__()
+            payload, iterator = self._prepare_source(
+                request, provider_id, credential_id, credential_data,
+                target.model, effort_cap, permit)
             # 在途登记放在创建迭代器之后、`try` 之前：选号到此全同步，不会与
             # 并发请求交错超额；释放统一走下面的 finally，覆盖成功/轮换/断开。
             self._lease(credential_id)
@@ -1018,9 +1022,13 @@ class Executor:
                 # （超时后它可能还在等上游），再关闭上游流归还节流名额。
                 # 顺序不能反：生成器正在被 anext 驱动时 aclose 会抛
                 # "asynchronous generator is already running"。
-                await reader.aclose()
-                await aclose_stream(iterator)
-                self._release(credential_id)
+                try:
+                    await reader.aclose()
+                    await aclose_stream(iterator)
+                finally:
+                    self._release(credential_id)
+                    if permit is not None:
+                        permit.close()
             if queued_wait is not None:
                 # 在租约与上游流都释放**之后**才等：等待期间不占并发名额，
                 # 也不让上游连接白挂着。等完回到 while 顶部用 `pinned` 重开。
@@ -1220,9 +1228,29 @@ class Executor:
             return None
         return downgrade_effort(effort)
 
+    def _prepare_source(self, request: ChatRequest, provider_id: str,
+                        credential_id: str, credential_data: dict[str, Any],
+                        model: str, effort_cap: str | None,
+                        permit: PacerPermit | None
+                        ) -> tuple[dict[str, Any], AsyncIterator[Event]]:
+        try:
+            payload = self._compress_payload(request, provider_id, model)
+            payload = self._map_effort(provider_id, payload)
+            payload = self._clamp_effort(payload, effort_cap)
+            payload = self._redact_payload(payload, provider_id)
+            self._debug_prefix(credential_id, provider_id, model, payload)
+            return payload, self._stream_source(
+                provider_id, credential_data, payload, model, credential_id, permit).__aiter__()
+        except BaseException:
+            self._drop_probe(credential_id)
+            if permit is not None:
+                permit.close()
+            raise
+
     def _stream_source(self, provider_id: str, credential_data: dict[str, Any],
                        payload: dict[str, Any], model: str,
-                       credential_id: str | None = None) -> AsyncIterator[Event]:
+                       credential_id: str | None = None,
+                       permit: PacerPermit | None = None) -> AsyncIterator[Event]:
         """上游事件流入口；开启截断续写时包一层。
 
         续写在包装器内固定用同一凭证续发请求，因此凭证轮换/记账/统计
@@ -1233,15 +1261,16 @@ class Executor:
         """
         set_credential_id(credential_id)
         upstream_model = self._upstream_model(provider_id, model)
+        options = {} if permit is None else {"permit": permit}
         stream = self._deps.providers[provider_id].stream_chat(
-            credential_data, payload, upstream_model)
+            credential_data, payload, upstream_model, **options)
         # 续写上限可热更：0 表示关闭，每次请求读当前值
         max_continues = int(live(self._deps.max_auto_continues)())
         if max_continues <= 0:
             return stream
         return ContinuationStream(
             self._deps.providers[provider_id], credential_data, payload,
-            upstream_model, max_continues=max_continues)
+            upstream_model, max_continues=max_continues, initial_stream=stream)
 
     def _record_success(self, target: ModelTarget, state: _StreamState,
                         provider_id: str, credential_id: str, *,
@@ -1375,6 +1404,10 @@ class Executor:
                 pinned = None
                 if self._safe_credential_data(credential_id) is None:
                     continue
+                pick = await self._pick(target, set(), credential_id, only=credential_id)
+                if pick is None:
+                    continue
+                credential_id, credential_data, permit = pick
                 provider_id = self._deps.credentials.provider_of(credential_id)
                 last_provider, last_credential = provider_id or "-", credential_id
             else:
@@ -1396,26 +1429,21 @@ class Executor:
                     raise NoHealthyCredential(
                         self._unavailable_text(target, last_error),
                         retry_after=self._recovery_seconds(target))
-                credential_id, credential_data = pick
+                credential_id, credential_data, permit = pick
                 tried.add(credential_id)
                 attempts += 1
                 provider_id = self._deps.credentials.provider_of(credential_id)
                 last_provider, last_credential = provider_id or "-", credential_id
             # 与 _stream_loop 同理：按实际服务渠道压缩（对同一请求可能压多次，
             # 但实现必须无副作用——每轮都从原文出发），再按实际服务渠道映射档位
-            payload = self._compress_payload(request, provider_id, target.model)
-            payload = self._map_effort(provider_id, payload)
-            payload = self._clamp_effort(payload, effort_cap)
-            payload = self._redact_payload(payload, provider_id)
-            self._debug_prefix(credential_id, provider_id, target.model, payload)
             events: list[Event] = []
             # 上游自报模型名（首个带 model 的事件）：只用于静默替换观测
             observed_model: str | None = None
             # 与 _stream_loop 同理：显式关闭上游流，让节流名额在每次尝试
             # 结束时同步归还，不依赖 GC 的 asyncgen finalize
-            iterator = self._stream_source(
-                provider_id, credential_data, payload, target.model,
-                credential_id).__aiter__()
+            payload, iterator = self._prepare_source(
+                request, provider_id, credential_id, credential_data,
+                target.model, effort_cap, permit)
             # 与 _stream_loop 同理：在途登记 + finally 释放（含超时/断开）
             self._lease(credential_id)
             queued_wait: float | None = None
@@ -1623,8 +1651,12 @@ class Executor:
                         output_tokens=usage.get("completion_tokens"))
                     return result
             finally:
-                await aclose_stream(iterator)
-                self._release(credential_id)
+                try:
+                    await aclose_stream(iterator)
+                finally:
+                    self._release(credential_id)
+                    if permit is not None:
+                        permit.close()
             if queued_wait is not None:
                 # 租约与上游流都释放**之后**才等（同 _stream_loop）
                 await asyncio.sleep(queued_wait)
@@ -1670,7 +1702,7 @@ class Executor:
         self._deps.affinity.remember(request.raw, username, credential_id)
 
     async def _pick(self, target: ModelTarget, tried: set[str],
-                    affinity_id: str | None = None):
+                    affinity_id: str | None = None, *, only: str | None = None):
         """选一个「仓库里还在」的凭证；被并发删除就换下一个。
 
         循环而不是递归：候选池理论上无上限，`tried` 又只在删一个后加一项，
@@ -1697,9 +1729,24 @@ class Executor:
           再 503。
         """
         waited = False
+        capacity_started: float | None = None
         while True:
-            credential_id = self._select(target, tried, affinity_id)
+            admission: dict[str, _ChatCapacity] = {}
+            credential_id = self._select(target, tried, affinity_id,
+                                         admission=admission, only=only)
             if credential_id is None:
+                blocked = [item for item in admission.values() if item.delay > 0]
+                if blocked:
+                    if capacity_started is None:
+                        capacity_started = self._clock()
+                    remaining = CHAT_CAPACITY_WAIT_SECONDS - (self._clock() - capacity_started)
+                    if remaining <= 0:
+                        logger.info("聊天容量等待超时 capacity_wait_ms=%.1f model=%s",
+                                    (self._clock() - capacity_started) * 1000, target.model)
+                        return None
+                    delay = min(remaining, 1.0, *(item.delay for item in blocked))
+                    await blocked[0].pacer.wait_for_change(delay)
+                    continue
                 # 没有立即可用候选：短冷却「等待续上」只允许一次（见 docstring）
                 retry_id = None if waited else await self._wait_short_cooldown(target)
                 if retry_id is None:
@@ -1709,9 +1756,18 @@ class Executor:
                 # 它若已不在候选池（并发删除）则 discard 是空操作。
                 tried.discard(retry_id)
                 continue
-            credential_data = self._safe_credential_data(credential_id)
+            capacity = admission.get(credential_id)
+            credential_data = (capacity.data if capacity is not None
+                               else self._safe_credential_data(credential_id))
             if credential_data is not None:
-                return credential_id, credential_data
+                permit = None if capacity is None else capacity.pacer.try_reserve(capacity.key)
+                if capacity is not None and permit is None:
+                    self._drop_probe(credential_id)
+                    continue
+                if capacity_started is not None:
+                    logger.info("聊天容量等待结束 capacity_wait_ms=%.1f model=%s",
+                                (self._clock() - capacity_started) * 1000, target.model)
+                return credential_id, credential_data, permit
             # 选中的号在真正使用前被淘汰：半开探测位不能跟着卡住
             self._drop_probe(credential_id)
             tried.add(credential_id)  # 并发删除 / 解不开：标记后重选
@@ -1997,7 +2053,9 @@ class Executor:
         return self._quota_exhausted(credential_id, provider_id)
 
     def _select(self, target: ModelTarget, tried: set[str],
-                affinity_id: str | None = None) -> str | None:
+                affinity_id: str | None = None, *,
+                admission: dict[str, _ChatCapacity] | None = None,
+                only: str | None = None) -> str | None:
         """按模型收窄候选 → 过滤该模型上被冷却的凭证 → 粘性/pin/排序选号。
 
         模型冷却按凭证所属上游的原始模型名登记（见 `_model_scope`），
@@ -2020,7 +2078,36 @@ class Executor:
             raise NoProviderForModel(f"no provider registered for model {target.model!r}")
         now = int(time.time())
         usable = self._selectable(self._deps.credentials.candidates(registered),
-                                  target, now)
+                                  target, now, include_chat_full=admission is not None)
+        if only is not None:
+            usable = [candidate for candidate in usable if candidate.credential_id == only]
+        if admission is not None:
+            ready = []
+            for candidate in usable:
+                credential_id = candidate.credential_id
+                if credential_id in tried:
+                    continue
+                bucket_for = getattr(self._deps.providers[candidate.provider], "chat_bucket", None)
+                if bucket_for is None:
+                    ready.append(candidate)
+                    continue
+                data = self._safe_credential_data(credential_id)
+                if data is None:
+                    continue
+                bucket = bucket_for(data)
+                if bucket is None:
+                    if (self._deps.inflight is None
+                            or not self._deps.inflight.blocked(credential_id)):
+                        ready.append(candidate)
+                    continue
+                pacer, key = bucket
+                delay = pacer.ready_in(key)
+                if self._deps.inflight is not None and self._deps.inflight.blocked(credential_id):
+                    delay = float("inf")
+                admission[credential_id] = _ChatCapacity(data, pacer, key, delay)
+                if delay <= 0:
+                    ready.append(candidate)
+            usable = ready
         if not usable:
             return None
         return self._choose(usable, target, tried, affinity_id, now)
@@ -2073,7 +2160,8 @@ class Executor:
             return (credential_id, scope)
         return None
 
-    def _selectable(self, candidates: list, target: ModelTarget, now: int) -> list:
+    def _selectable(self, candidates: list, target: ModelTarget, now: int, *,
+                    include_chat_full: bool = False) -> list:
         """按「该凭证所属上游的原始模型名」过滤出当前可选的候选。
 
         顺手把**当前模型**的消耗倍率按渠道注进候选快照（free-tier 优先档的
@@ -2096,7 +2184,9 @@ class Executor:
             c for c in candidates
             if c.is_selectable(now, self._model_scope(c.provider, target.model))
             and (guard is None or not guard.blocked(c, target.model))
-            and (inflight is None or not inflight.blocked(c.credential_id))
+            and (inflight is None or not inflight.blocked(c.credential_id)
+                 or (include_chat_full
+                     and callable(getattr(self._deps.providers[c.provider], "chat_bucket", None))))
         ]
         if inflight is not None:
             selected = [replace(c, inflight=inflight.count(c.credential_id))
@@ -2303,8 +2393,7 @@ class Executor:
 
         - `attempts -= 1`：排队不是「换号尝试」。不归还的话三次排队就把
           `max_rotate` 吃满，请求直接 503。
-        - `pinned` 记下被点名的凭证，下一轮跳过 `_pick` 直接用——否则可能选到
-          别的号，排队语义就丢了。
+        - `pinned` 记下被点名的凭证，下一轮只对该账号重新申请容量。
         """
         wait = self._queue_wait(retry_after, emitted, rounds)
         if wait is None:

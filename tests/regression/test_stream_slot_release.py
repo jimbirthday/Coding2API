@@ -84,11 +84,8 @@ class _HangingClient:
     """吐一个正文后永久挂起：只能靠外部关闭结束，用于模拟客户端断开。"""
 
     async def stream_chat(self, credential, payload, model) -> AsyncIterator[Event]:
-        try:
-            yield Event(kind=EventKind.CONTENT, content="hi")
-            await asyncio.sleep(3600)
-        finally:
-            yield Event(kind=EventKind.FINISH, finish_reason="stop")   # pragma: no cover
+        yield Event(kind=EventKind.CONTENT, content="hi")
+        await asyncio.sleep(3600)
 
 
 def _request(index: int = 0, *, stream: bool = True) -> ChatRequest:

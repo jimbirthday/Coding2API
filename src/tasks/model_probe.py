@@ -35,7 +35,7 @@ import logging
 from typing import Any
 
 from ..db.crypto import CredentialDecryptError
-from ..provider.base import ErrKind, EventKind, UpstreamHTTPError, event_error_kind
+from ..provider.base import ErrKind, EventKind, UpstreamHTTPError, aclose_stream, event_error_kind
 from . import TaskReport
 
 logger = logging.getLogger(__name__)
@@ -178,14 +178,18 @@ class ModelProbeTask:
             await self._pacer.wait_turn()
         try:
             async with asyncio.timeout(self._timeout):
-                async for event in provider.stream_chat(data, probe_payload(), model):
-                    if event.kind is EventKind.ERROR:
-                        kind = event_error_kind(event)
-                        detail = event.error_message or f"error {event.error_code}"
-                        return ("failed" if kind in _FAILURE_KINDS else "inconclusive",
-                                _trim(detail))
-                    if event.kind in (EventKind.CONTENT, EventKind.FINISH):
-                        return ("ok", "")
+                source = provider.stream_chat(data, probe_payload(), model)
+                try:
+                    async for event in source:
+                        if event.kind is EventKind.ERROR:
+                            kind = event_error_kind(event)
+                            detail = event.error_message or f"error {event.error_code}"
+                            return ("failed" if kind in _FAILURE_KINDS else "inconclusive",
+                                    _trim(detail))
+                        if event.kind in (EventKind.CONTENT, EventKind.FINISH):
+                            return ("ok", "")
+                finally:
+                    await aclose_stream(source)
         except UpstreamHTTPError as error:
             state = "failed" if error.kind() in _FAILURE_KINDS else "inconclusive"
             return (state, _trim(f"HTTP {error.status}: {error}"))

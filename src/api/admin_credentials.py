@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import time
+from datetime import UTC, datetime
 
 import httpx
 from fastapi import APIRouter, Depends
@@ -38,6 +39,7 @@ from ..auth.rbac import require_operator
 from ..compat.openai.request import InvalidRequest
 from ..engine.limits import day_start
 from ..provider.base import CheckinResult, GrowthResult, GrowthStep, StepStatus
+from ..provider.codearts.credential import CodeArtsCredential
 from ..provider.login_identity import (
     MANUAL_MERGE_PROVIDERS,
     login_identities_for,
@@ -907,6 +909,39 @@ def create_router(services: Services) -> APIRouter:
         if services.credentials.provider_of(credential_id) is None:
             raise InvalidRequest("credential not found")
         return {"events": services.checkin_events.recent(credential_id, limit=limit)}
+
+    @router.post("/api/credentials/codearts/export")
+    async def export_codearts_credentials(payload: dict,
+                                          _csrf: None = Depends(csrf_protected),
+                                          principal=Depends(principal_from_request)):
+        require_operator(principal)
+        raw_ids = payload.get("ids")
+        if "ids" in payload:
+            if (not isinstance(raw_ids, list) or not raw_ids
+                    or any(not isinstance(item, str) or not item.strip() for item in raw_ids)):
+                raise InvalidRequest("ids must be a non-empty list of credential ids")
+            if len(raw_ids) > BATCH_MAX_IDS:
+                raise InvalidRequest(f"too many credentials (max {BATCH_MAX_IDS})")
+            ids = list(dict.fromkeys(item.strip() for item in raw_ids))
+        else:
+            ids = [item.credential_id for item in credentials.candidates(["codearts"])]
+        exported = []
+        now = int(time.time())
+        for credential_id in ids:
+            entry = credentials.export_entry(credential_id)
+            if entry is None:
+                raise InvalidRequest("credential not found")
+            if entry["provider"] != "codearts":
+                raise InvalidRequest("only CodeArts credentials can be exported in this format")
+            exported.append(CodeArtsCredential.from_dict(entry["credential"])
+                            .to_plugin_dict(updated_at=now))
+        services.audit.record(actor=principal.username, action=ACTION_CREDENTIAL_EXPORT,
+                              target=None, detail=f"CodeArts 插件格式：导出 {len(exported)} 个账号")
+        stamp = datetime.fromtimestamp(now, UTC).strftime("%Y%m%d_%H%M%S")
+        return JSONResponse(exported, headers={
+            "Content-Disposition": f'attachment; filename="codearts_{len(exported)}_{stamp}.json"',
+            "Cache-Control": "no-store",
+        })
 
     @router.get("/api/credentials/{credential_id}/export")
     async def export_credential(credential_id: str,

@@ -157,7 +157,8 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                "主窗口打平（含都为 0）时才参与比较；主窗口 ≤0 时本项自动失效。",
                minimum=0, group="affinity"),
     HotSetting("conversation_sticky_seconds", int, "会话粘性 TTL（秒）",
-               "同一对话的多轮请求固定用同一凭证；≤0 关闭粘性。",
+               "同一对话优先复用原凭证；CodeArts 原账号容量满时转移到可用账号，"
+               "成功后更新绑定。≤0 关闭粘性。",
                group="affinity"),
     HotSetting("max_inflight_per_credential", int, "单账号在途上限",
                "同一凭证的并发请求达到该值后不再参与选号，避免把单账号打进上游"
@@ -247,8 +248,9 @@ HOT_SETTINGS: tuple[HotSetting, ...] = (
                minimum=0.0, group="chat_throttle"),
     HotSetting("codearts_max_concurrency", int, "CodeArts 每账号并发上限",
                "CodeArts 上游硬限每账号并发会话数 3，超限请求直接 400 "
-               "TM.00001041（实测 77% 失败率主因）。默认 3 对齐上游；0 关闭上限"
-               "（回到「有在途即放行」，会再次击穿）。", minimum=0,
+               "TM.00001041。选号时原子预占，满载账号让出选号。与节流窗口组合后，"
+               "该值也限制窗口内启动次数，例如 2 + 60 秒表示每账号每 60 秒最多"
+               "启动 2 次。默认 3；0 关闭上限。", minimum=0,
                group="codearts_throttle"),
     HotSetting("codearts_request_window_seconds", float, "CodeArts 账号节流窗口（秒）",
                "与「每账号并发上限」组合成滑动窗口：最近这么多秒内最多启动 N 次。"

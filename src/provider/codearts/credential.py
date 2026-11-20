@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from .. import credential_fields
@@ -101,6 +102,24 @@ class CodeArtsCredential:
             "domain": self.domain, "domain_id": self.domain_id,
             "nickname": self.nickname,
             "web_cookie": self.web_cookie,
+        }
+
+    def to_plugin_dict(self, *, updated_at: int) -> dict[str, Any]:
+        return {
+            "user_id": self.uid,
+            "user_name": self.user_name,
+            "domain_id": self.domain_id,
+            "cloud_dragon_token": self.security_token,
+            "access_key_id": self.access_key_id,
+            "secret_access_key": self.secret_access_key,
+            "expiration": (datetime.fromtimestamp(self.expiration, UTC)
+                           .isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                           if self.expiration > 0 else ""),
+            "refresh_token": self.refresh_token,
+            "code_verifier": self.code_verifier,
+            "updated_at": updated_at,
+            "client_id": self.client_id,
+            "dpop_private_key": dict(self.dpop_private_jwk),
         }
 
     @classmethod

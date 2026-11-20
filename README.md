@@ -13,7 +13,7 @@
 ## 特性
 
 - **OpenAI 兼容出口**：`/v1/chat/completions`（流式 / 非流式）、`/v1/responses`（Codex CLI）、`/v1/messages`（Claude Code）、`/v1beta/models/{m}:generateContent`（Gemini SDK）、`/v1/models`（含单模型查询）、`/v1/user/balance`。
-- **统一调度**：扁平名按健康度选号；`模型@渠道` 强制。优先级：免费渠道 → 在途最少 → 到期额度 → 健康度 + 分级冷却 → 余额多者。管理员可给凭证设**权重**（`-1000..1000`）：只在同一健康档内重排（正数优先、负数当备用），不会把冷却/耗尽的号顶上来。目录里的 x0 会被最近 24h 的实测扣费校准（上游改计费不改目录时不至于永远占住免费档）。模型级限流只避让该模型；多轮对话粘同一凭证，出错才轮换。
+- **统一调度**：扁平名按健康度选号；`模型@渠道` 强制。优先级：免费渠道 → 在途最少 → 到期额度 → 健康度 + 分级冷却 → 余额多者。管理员可给凭证设**权重**（`-1000..1000`）：只在同一健康档内重排（正数优先、负数当备用），不会把冷却/耗尽的号顶上来。目录里的 x0 会被最近 24h 的实测扣费校准（上游改计费不改目录时不至于永远占住免费档）。模型级限流只避让该模型；CodeArts 在粘性/pin 前先筛聊天容量，粘性号可启动时优先复用，满额时可迁到其他可启动账号；出错仍按原规则轮换。
 - **到期额度优先**：主窗口（默认 36h）先烧将过期额度；打平再比 7 天窗口。单位统一积分。
 - **模型列表按凭证加载**：只列有可用凭证的渠道 → 无幽灵模型。
 - **公共凭证池**：admin 维护、全员共享、加密入库（`APP_SECRET`）；设备码登录、多账号切换、额度探测、签到、token 预刷新。
@@ -248,6 +248,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 **逐笔到期（网页 Cookie）**：statistics 只给「7 天内到期量」，逐笔 `expireAt` 只在网页控制台 portal——`GET /portal/promptcenter/v1/ops/credit/overview` 列活动，`GET .../campaign/{id}?pageNum=&pageSize=` 分页给每次发放（`claimedAmount` / `consumedAmount` / `expiredAmount` / `expireAt`）。portal **只认控制台会话 Cookie**（AK/SK 签名打不通，且必须带 `X-Requested-With: XMLHttpRequest`）。凭证行「更多 → 网页 Cookie」粘贴后，探测改走 portal：福利积分按笔展开、真实到期参与「快过期先用」，基础/按需仍取汇总；Cookie 失效/改版**静默回退** 7 天窗口口径，不判探测失败。`expiredAmount` 与 `status` 会滞后（实测过期后仍为 0 / `CLAIMED`），判死只看 `expireAt <= now`；已过期的逐笔**不再展示**。Cookie 失效（portal 回登录页/空响应）时，凭证行标「网页 Cookie 已失效，请重贴」；重新粘贴后状态复位，额度汇总不受影响（控制台会话无法自动刷新）。
 
 **签名 / 累计全文 SSE / 节流**：华为云 `SDK-HMAC-SHA256`（AK/SK + `X-Security-Token`）；白名单须含 snap 引擎、STS、门户。流式 `text` 为累计全文（替换语义）→ 还原增量。上游硬限每账号并发 3 → `CODEARTS_MAX_CONCURRENCY` + `CODEARTS_REQUEST_WINDOW_SECONDS`。
+
+**容量准入**：按账号 `uid` 共用节流桶（缺失时退到 AK），同账号多条凭证不会各获一份容量。在可启动候选中仍按 pin → 会话粘性 → 排序选号；满额的 sticky/pin 不阻挡其他可启动账号。全池合格候选都因容量阻塞时，每次选号最多等 60 秒，不占 executor 在途租约；名额释放、窗口到期或配置热更后重新扫描候选（最长每秒复查）。排队及其他固定原号重试只在原账号上做容量准入。例如设置 `CODEARTS_MAX_CONCURRENCY=2`、`CODEARTS_REQUEST_WINDOW_SECONDS=60` 时，每账号每 60 秒最多启动两次，且最多两次在途；流结束不会提前归还已消耗的窗口配额。
+
+选号与 permit 预占同步完成；准备失败或启动前取消会回滚未使用名额（含窗口配额），provider 提交后则保留已消耗的窗口配额至到期。
+
+CodeArts 已输出后的每轮自动续写仅尝试同账号原子准入，若不能立即启动则保留原 `finish_reason=length` 正常截断收尾，避免在 provider 本地节流等待中被误判为上游空闲超时；首轮请求与固定原号重试仍分别按上述全池/同账号规则做有界等待。
+
+**耗时日志**：executor 在容量等待结束/超时时记录 `capacity_wait_ms`；CodeArts provider 记录节流等待 `throttle_wait_ms`、启动至首个上游事件 `upstream_first_ms`、首事件至关流结束 `generation_ms`，无上游事件时后两项为 `None`。provider 节流耗时不包含 executor 容量等待；日志通过上下文的 `request_id` 关联。准入计数与等待仅在当前进程内共享。
 
 ### OfficeAce（`officeace`）
 
@@ -494,6 +502,7 @@ export GOOGLE_GENAI_BASE_URL=http://127.0.0.1:8000   # SDK 会自拼 /v1beta
 - **手动 RT 刷新**：`POST /api/credentials/{id}/refresh` 无视预刷新窗口，立即用 refresh_token 换新 access token；成功后先落库轮转后的 RT，再解除硬禁用 / 本地冷却并排队重探额度。响应 `{ok, refreshed, rotated, expires_at, revived, reason?, error?}`，上游明确判票作废时是 `ok=false, error="relogin_required"`（HTTP 200，不是 500）。批量 `refresh` 逐条隔离并调用同一实现，成功后同样重探额度；两条入口都会写 `credential.refresh` 审计（批量只写一条汇总）。行内与批量入口仅对有刷新能力的渠道显示，手工 token 没有 RT 时逐条返回 `credential has no refresh_token`。
 - **批量导入**：`POST /api/credentials/batch-import`，body `{items: [{provider, credential, nickname?, tags?}]}`。一次 ≤100 条；逐条校验，坏条目只进 `failed`（带 `index` 与原因）；同渠道解密后内容完全一致视为重复，进 `skipped`。管理台凭证页「批量导入」支持粘贴 JSON 数组 / JSONL 或选文件。
 - **单条导出**：`GET /api/credentials/{id}/export` 返回与批量导入**同形**的 JSON（`provider` / `credential` / `nickname` / `tags`），可原样再导入。响应带 `Content-Disposition` 附件头与 `no-store`，内容是**明文凭证**——只对 admin/operator 开放，且落 `credential.export` 审计。管理台入口：凭证行「更多操作 → 导出凭证」。
+- **CodeArts 插件格式导出**：渠道组头「导出全部」，或勾选 CodeArts 账号后「导出选中」，下载 `codearts_数量_日期_时间.json`。`POST /api/credentials/codearts/export` 接受 `{}`（全部，包括暂停/禁用账号，不受页面筛选影响）或 `{ids: [...]}`（最多 200 条、去重保序）。返回与插件账号文件相同的 JSON 数组，字段含 `user_id`、`cloud_dragon_token`、`dpop_private_key`、AK/SK、RT、`code_verifier`、`client_id`；到期时间为 UTC ISO8601（库内精度为秒），未知为空串，`updated_at` 为本次导出的 epoch 秒。文件可重新导入，不携带网页 Cookie / 密码 / 昵称 / 标签。导出读取当前存储值，不刷新 RT；仅 admin/operator 可用，校验整批后返回文件，缺失或其他渠道 id 返回 400，落一条汇总审计并带 `no-store`。
 - **逐条隔离**：单条失败不影响其余。响应 `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`。
 - **勾选删除**：`action="delete"` 按提交的 id 逐条删除。管理台点「删除选中」先进入二次确认并冻结当时的 id 快照，确认前不发请求；确认期间筛选或勾选变化不会改变删除目标。已不存在的 id 逐条返回 `credential not found`，不影响其余条；整批落一条 `credential.delete` 汇总审计。
 - **签到失败是结果不是故障**：上游拒绝（账号被禁用 / 登录过期 / 限流）回 `ok=false` + 可读 `message`，不 500——否则管理台只弹「签到失败」，看不出真实原因。
@@ -811,7 +820,7 @@ python3 scripts/restore_db.py data/backups/coding2api-20261014-030000.sqlite3 --
 | `MODEL_PROBE_MINUTES` | `0` | 主动探活周期（`0` = 关）。探仍被 `blocked` 负缓存锁住与已判死的 (渠道, 模型)；成功即恢复展示并清负缓存，其余绝不禁用。可热更 |
 | `QUOTA_EXPIRY_WINDOW_SECONDS` | `129600` | 主到期排序窗口；`≤0` 关闭 |
 | `QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS` | `604800` | 次到期窗口；`≤0` 关闭 |
-| `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL。优先级：请求体会话标识 > 请求头 > 消息前缀指纹；pin 最高。`≤0` 关 |
+| `CONVERSATION_STICKY_SECONDS` | `3600` | 会话粘性 TTL。优先级：请求体会话标识 > 请求头 > 消息前缀指纹；可启动候选中 pin 最高。`≤0` 关 |
 | `MODEL_BLOCKLIST` | `custom_model_*,*sub*agent*,summary,browser_use_*,file_search_agent,default,fast,balanced,deep,primary,auto,sagitta,aquila,glm-4.*,glm-5,glm-5-turbo,glm-5.0*,glm-5.1,glm-5v-*,glm-5.2*,glm.5.2*,kimi-k2.*,kimi-k2.5,kimi-k2.6,kimi-k2-thinking,kimi-k3,minimax-m2.5,minimax-m2.7,minimax-m3,deepseek-v3-*,deepseek-v4-*,qwen3.7-*,qwen3-*,qwen3.6*,qwen3-vl-235b,gpt-5.4,gpt-5.5,gpt-5.6*,hy3*,hy4-preview,hunyuan-*,seed-2.1*,seed-2-1-turbo,doubao-seed-2.1-turbo,seed-code-pro-*,seed-evolving,space-bunny,nemotron-3-*,nemotron-3*,lfm2*,laguna*,north-mini-code,inkling-small,xing4.0-29b-a4,glyph-cluster,openrouter-models-router,deepseek-v4.1-flash-0930,deepseek-v4.1-flash-bnt,glm-5.3-test,glm-5.3-zx,kimi-k3-test-1009,kimi-k3-1019` | 列表黑名单（fnmatch，仅影响展示），按归一后写法匹配 |
 | `MODEL_FALLBACK_GROUPS` | `""` | 跨渠道 fallback 组：`组名=成员1,成员2;…`。留空不启用 |
 | `ALLOWED_HOSTS` | 空 | Host 白名单，防 DNS rebinding |

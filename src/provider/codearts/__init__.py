@@ -24,18 +24,22 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...provider.base import CheckinResult, ErrKind, Event, Model, Quota
-from ...tasks.pacer import paced
+from ...provider.base import CheckinResult, ErrKind, Event, Model, Quota, aclose_stream
+from ...tasks.pacer import Pacer, PacerPermit, paced
 from ..login_identity import login_identity_for
 from . import dpop
 from . import events as codearts_events
 from .client import CodeArtsClient
 from .credential import CodeArtsCredential
 from .events import UpstreamProtocolViolation
+
+logger = logging.getLogger(__name__)
 
 
 def credential_key(credential: CodeArtsCredential) -> str:
@@ -102,14 +106,35 @@ class CodeArtsProvider:
         data["web_cookie"] = cookie
         return data
 
+    def chat_bucket(self, credential_data: dict) -> tuple[Pacer, str] | None:
+        if self.pacer is None:
+            return None
+        return self.pacer, credential_key(CodeArtsCredential.from_dict(credential_data))
+
     async def stream_chat(self, credential_data: dict, payload: dict,
-                          model: str) -> AsyncIterator[Event]:
+                          model: str, *, permit: PacerPermit | None = None
+                          ) -> AsyncIterator[Event]:
         """引擎调用入口：dict 凭证 → 上游流 → 中立事件。"""
         credential = CodeArtsCredential.from_dict(credential_data)
         key = credential_key(credential)
-        async with paced(self.pacer, key):
-            async for event in self.client.stream_chat(credential, payload, model):
-                yield event
+        queued = time.monotonic()
+        async with paced(self.pacer, key, permit=permit):
+            started = time.monotonic()
+            first = None
+            source = self.client.stream_chat(credential, payload, model)
+            try:
+                async for event in source:
+                    if first is None:
+                        first = time.monotonic()
+                    yield event
+            finally:
+                await aclose_stream(source)
+                ended = time.monotonic()
+                logger.info(
+                    "CodeArts 聊天耗时 throttle_wait_ms=%.1f upstream_first_ms=%s generation_ms=%s",
+                    (started - queued) * 1000,
+                    None if first is None else round((first - started) * 1000, 1),
+                    None if first is None else round((ended - first) * 1000, 1))
 
     async def refresh(self, credential_data: dict) -> dict:
         """预刷新：回写新 refresh_token 与临时凭证（一次性 token 必须轮转）。"""

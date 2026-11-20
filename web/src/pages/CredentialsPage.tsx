@@ -709,6 +709,28 @@ export function CredentialsPage() {
     });
   };
 
+  const exportCodeArts = async (ids?: string[]) => {
+    setBusy(true);
+    try {
+      const accounts = await api.exportCodeArts(ids);
+      const blob = new Blob([JSON.stringify(accounts, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "_").slice(0, 15);
+      anchor.href = url;
+      anchor.download = `codearts_${accounts.length}_${stamp}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      showNotice(`已导出 ${accounts.length} 个 CodeArts 账号（含明文令牌，请妥善保管）`);
+    } catch (caught) {
+      showError(caught instanceof Error ? caught.message : "导出 CodeArts 失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const actions: Actions = {
     // 会话失效被硬禁用的凭证：重新登录后用「恢复」放回池子，
     // 不必删除重建（以前只能删除）。**保留**上游点名的冷却（限流/余额/
@@ -1134,6 +1156,17 @@ export function CredentialsPage() {
                         {button.verb}
                       </Button>
                     ))}
+                    {selectedIds.every((credential) => credential.provider === "codearts") && (
+                      <Button
+                        size="sm"
+                        disabled={busy}
+                        data-testid="batch-export-codearts"
+                        onClick={() => void exportCodeArts(
+                          selectedIds.map((credential) => credential.id))}
+                      >
+                        <Download className="size-3.5" /> 导出选中
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant="danger"
@@ -1548,6 +1581,18 @@ export function CredentialsPage() {
                                     </span>
                                   </button>
                                 </LongTextTip>
+                              )}
+                              {canWrite && group.provider === "codearts" && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={busy}
+                                  data-testid="export-provider-codearts"
+                                  title="导出全部 CodeArts 账号（含明文令牌，不受筛选影响）"
+                                  onClick={() => void exportCodeArts()}
+                                >
+                                  <Download className="size-3.5" /> 导出全部
+                                </Button>
                               )}
                               {canWrite && (
                                 confirmClearProvider === group.provider ? (

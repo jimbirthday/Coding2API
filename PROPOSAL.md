@@ -45,7 +45,7 @@
 - **每日签到**：`GET {snap}/v1/ops/delivery?channel=IDE` → `POST /v1/ops/claim` → `POST /v1/ops/confirm`；`/v1/ops/*` 挂 snap 引擎根、不带 `snap-manager`。活动按 `type=USER_LOGIN` 挑、`campaignId` 取当轮响应（上游改过 ID：1→34，面额 1000→100，写死 ID 会让签到静默失效）。`ELIGIBLE`→claim+confirm；`CLAIMED`（已领未确认，非终态）→只补 confirm；`CONFIRMED`/`CONSUMED`→已签。**claim 时积分即到账**，confirm 只推进状态；业务码走 HTTP 200。**同一账号重新登录按 `uid` 合并既有凭证**（更新整份凭证并解除硬禁用，账号级冷却按来源保留上游点名的几类，保留 paused/pinned/标签/统计归属），不新增重复行。身份按别名集合取交集（`uid` 与 `domain_id|user_name` 任一命中即同账号），避免身份补全失败时新增重复行。
 - **额度＝积分**：`usageTotalPackageCredit` 直接进 `quota_remaining`/`quota_total`，不做单位折算；分项包走 `quota_packages`，`end_date` 只作套餐到期日展示（`cycle_end` / `packages[].end`），**不进到期阶梯**。**福利积分按批次到账、各自到期**：实测同一响应里 `end_date` 距今 2.5 天而「7 天内到期量」只有 4,868 / 24,391，若 `end_date` 会清零整份余额，7 天内到期量必然等于全部余额——故 `end_date` 不是逐笔积分的作废时刻。无网页 Cookie 时，到期阶梯只认 `package_credit_expiring_amount`（7 天内到期量，分项求和后挂到「探测时刻 + 7 天」这一个桶：36h 窗口不误报，7 天窗口拿到真实数字）。**逐笔到期走网页 Cookie**：portal `GET /portal/promptcenter/v1/ops/credit/overview` 列活动 → `GET .../campaign/{id}?pageNum=&pageSize=` 分页给每笔 `claimedAmount/consumedAmount/expiredAmount/expireAt`；只认控制台会话 Cookie（AK/SK 签名打不通，另需 `X-Requested-With: XMLHttpRequest`）。有 Cookie 时福利积分按笔展开、`expiry_ladder` 用真实 `expireAt`，基础/按需仍取汇总；Cookie 失效/形状变化静默回退 7 天窗口口径，不判探测失败。`expiredAmount`/`status` 滞后（实测过期后仍为 0/`CLAIMED`），判死只看 `expireAt <= now`；已过期的逐笔不展示。portal 回登录页/空响应时标 `web_cookie_state=expired`（管理台提示重贴），重新粘贴复位；控制台会话无法自动刷新。
 - **凭证页一个渠道一个组**：不拆两条凭证行——`refresh_token` 一次性，两条会各刷一次、第二条必报 `the refresh token has been used` 并烧掉票据。
-- **并发上限**：上游硬限每账号每约 60s 最多 3 个会话，超出 `400 TM.00001041`；配 `CODEARTS_MAX_CONCURRENCY` 与 `CODEARTS_REQUEST_WINDOW_SECONDS`。流式 `text` 是**累计全文（替换语义）**，解析层还原增量。
+- **并发上限**：上游硬限每账号每约 60s 最多 3 个会话，超出 `400 TM.00001041`；配 `CODEARTS_MAX_CONCURRENCY`（默认 3）与 `CODEARTS_REQUEST_WINDOW_SECONDS`（默认 60 秒），均可热更。例如设置并发上限 2、窗口 60 秒时，每账号每 60 秒最多启动两次，且最多两次在途。节流桶按 `uid` 共用（缺失时退到 AK），同账号多凭证共享容量。流式 `text` 是**累计全文（替换语义）**，解析层还原增量。
 - **流内业务错误分类**：错误内嵌 HTTP 200 的 SSE（`InferHub.<码>`），分类由 `Event.error_kind` 承载，`UpstreamStreamError.kind()` 与 `executor._event_kind` 共用 `provider.base.event_error_kind` 兜底。非多模态模型收图片归 `CAPABILITY`（`InferHub.001001020`）：跳过整个上游、不冷却、不累计，只落一行 `model_capability` 统计（与 `invalid_request` 分开，避免运维去查参数）。
 
 ### 2.5 OpenCode Zen（`zen`，虚拟凭证）
@@ -157,9 +157,11 @@ Provider 只管上游私有部分（发请求、解析事件、分类错误、�
 
 **选号前 `Executor._selectable` 两道过滤**（不进 `Candidate.is_selectable`）：① 凭证限额护栏；② 在途租约 `MAX_INFLIGHT_PER_CREDENTIAL`（默认 0 = 不限）——同账号并发达上限 → 整号不参与选号。在途计数进程内、请求结束释放（含断开/异常），600s TTL 兜底；跨渠道全局，与 `CODEARTS_MAX_CONCURRENCY` 正交。**在途计数兼作负载键**，上限为 0 也照常登记。
 
+**CodeArts 容量准入在粘性/pin 之前**：过滤在途、滑动窗口及最小间隔未就绪的账号，再从可启动候选选号。全池合格候选都因容量阻塞时，每次选号最多等 60 秒，不占 executor 在途租约；名额释放、窗口到期或配置热更后重扫全池，最长每秒复查。排队及其他固定原号重试只在原账号上做容量准入。选号与 permit 预占在同一事件循环中同步完成；准备失败或启动前取消归还未使用的 permit（含窗口配额），provider 提交后结束只归还在途名额，已提交的窗口配额保留到期。以上状态仅在当前进程内共享。
+
 过滤后按序出号：
 
-1. **手动 pin 优先**：候选池里有 `pinned` → **只在 pinned 之间排序**（绝对过滤，不是同档提权；否则免费档能随时顶掉管理员指定，指定变成「偶尔生效」）。指定了付费号就先用它，哪怕池里另有免费渠道。会话粘性命中且可选 → 直接复用，不参与排序。
+1. **手动 pin 优先**：可启动候选里有 `pinned` → **只在这些 pinned 之间排序**（绝对过滤，不是同档提权；否则免费档能随时顶掉管理员指定，指定变成「偶尔生效」）。指定了付费号就先用它，哪怕池里另有免费渠道。无可启动 pin 时，会话粘性命中且可启动 → 直接复用；sticky/pin 满额则可选其他可启动账号。
 2. **免费优先**：无 pin 时 `credit_rate == 0` 的渠道整体排前（`None` 不算免费，与 `0.0` 严格区分）；排在到期额度之前，因为省下的钱比「快过期先用」值钱。**x0 必须被实测扣费校准**：目录是上游自报，改计费常不改目录——2026-11-03 起 `codebuddy_intl/deepseek-v4.1-flash` 目录仍写 x0，每次实扣 ~0.14 积分，免费档压过所有到期积分（officeace 三条凭证 15.8 小时内到期的 100 积分包整夜闲置）。校准读 `usage_events` 的 `credit > 0 AND credit_estimated = 0`（上游真值，排除 TRAE 推算值），按 (渠道, 归一键) 聚合、24h 窗口、600s 快照；无观测行时仍信目录，目录给正数或 `None` 时不校准。
 3. **在途最少优先**：排在到期额度之前——到期/健康度是静态指标，并发会全压同一个号（实测 2 小时内一个号吃 180+ 次、其余闲置），在途把并发拆开；顺序请求（在途恒 0）不受影响，免费档仍压过在途。
 4. **到期额度两级字典序**：先比主窗口（`QUOTA_EXPIRY_WINDOW_SECONDS`，默认 36h）内将过期的额度，打平再比次窗口（`QUOTA_EXPIRY_SECONDARY_WINDOW_SECONDS`，默认 7 天）。
@@ -172,6 +174,8 @@ Provider 只管上游私有部分（发请求、解析事件、分类错误、�
 **健康度归一化**：CB 取 `CycleCapacityRemainPrecise`/`CycleCapacitySizePrecise`，TRAE 取 `credits_limit - credits_amount` / `credits_limit`。**不用 `TotalDosage`**：它 = Σ(size − CapacityUsed)，`CapacityUsed` 是上周期口径 → 出现 `remaining == total`、健康度恒 100。**必须三态**：探测失败算 0 分会让其永远轮不到。
 
 **会话粘性**三级识别：① 请求体 `conversation_id` / `conversationId` / `prompt_cache_key`；② 请求头 `x-session-id` / `x-opencode-session` / `x-session-affinity` / `thread-id` / `session-id` / `conversation-id`（须匹配 `[A-Za-z0-9._:-]{1,128}`，经 contextvar 传入，键带 `header:` 前缀避免与 body 撞键）；③ 消息增量前缀指纹。**头夹中间**：body 显式键最精确，头是客户端主动声明的身份、比指纹可靠。头值掺 `username` 再哈希——否则可猜头值占用别人账号。TTL（`CONVERSATION_STICKY_SECONDS`）默认 1h；带 `user_id` 时**不派生**前缀兜底键（同用户并行对话前缀可能相同）。手动 pin 优先；凭证报错仍走轮换；条目纯内存。
+
+**准入耗时观测**：executor 在容量等待结束/超时时记录 `capacity_wait_ms`；CodeArts provider 的 `throttle_wait_ms` / `upstream_first_ms` / `generation_ms` 分别记录 provider 节流等待、启动至首个上游事件、首事件至关流结束；无上游事件时后两项为 `None`。provider 节流耗时不包含 executor 容量等待；日志通过上下文的 `request_id` 关联请求。
 
 ### 3.4 模型名三字段
 
@@ -239,6 +243,7 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 14 张表，`SCHEMA_
 - 批量：`POST /api/credentials/batch`（`probe|toggle|checkin|revive|refresh|delete`）。逐条隔离，响应 `{total, succeeded, failed, results[]}`；`toggle`/`revive`/`refresh`/`delete` 落一条汇总审计。`delete` 由前端勾选后二次确认，确认时冻结 id 快照。
 - 批量删除渠道：`DELETE /api/credentials/provider/{provider}`（渠道级专用端点，与按 id 的勾选删除互补）。一次清空该渠道全部账号，响应 `{provider, deleted}`；未知渠道 400，空渠道 `deleted: 0`；前端渠道组头二次确认，落一条汇总审计。
 - 批量导入：`POST /api/credentials/batch-import`（`items[]`，≤100 条）。逐条校验，响应 `{created[], skipped[], failed[]}` 均带 `index`；同渠道内容完全一致去重；逐条审计 + 入队探测。
+- CodeArts 插件格式导出：`POST /api/credentials/codearts/export`，`{}` 导出全部，`{ids: [...]}` 导出选中（≤200 条）。返回插件同形数组与 `codearts_数量_日期_时间.json` 附件名，保留 RT/DPoP 等刷新字段，`expiration` 为 UTC ISO8601、`updated_at` 为导出 epoch 秒。读取当前存储值，admin/operator + CSRF、`no-store`、汇总 `credential.export` 审计；整批缺失/错渠道拒绝，前端渠道组头和勾选操作条提供下载入口。
 - 备份：`GET/POST /api/backups`、`GET/DELETE /api/backups/{name}`、`POST /api/backups/restore`（原始字节，≤512MB）。恢复用「校验 → 暂存 → 下次启动应用」而不是运行中换库；启动应用失败只留档、不阻断（`db/backup.apply_pending_restore`）。
 - 配置与任务：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`。列表端点统一 `sort` + `order`；未知键回落默认。回调：`GET /authorize`。
 - 告警：`GET /api/alerts` + `POST /api/alerts/{id}/resolve`。`AlertTask` 启动时从库里未恢复的行重建集合。规则九类（rule id：`pool_empty` / `task_failed` / `token_expiring` / `error_rate` / `key_burst` / `off_hours` / `budget` / `channel_dead` / `checkin_failing`）：池耗尽、任务连续失败、token 到期、上游错误率、单 Key 用量暴涨、非工作时段请求、**预算分层（50/80/95/100%）**、**渠道零成功（窗口内有流量但一次都没成功）**、**签到连续失败（同一凭证连续 N 轮业务失败，「任务跑成功但上游回失败」任务级计数看不见）**（单 Key / 非工作时段 / 预算三类默认阈值 0 = 关闭；渠道零成功与签到连续失败默认开启；不存 IP，故不做「多 IP 同 Key」）。
