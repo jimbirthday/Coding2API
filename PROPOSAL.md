@@ -236,8 +236,8 @@ DDL 以 [src/db/schema.sql](src/db/schema.sql) 为准，共 14 张表，`SCHEMA_
 - 账号：`GET|POST /api/users`、`PATCH /api/users/{username}`、`PUT /api/users/{username}/policy`（用户级模型白名单 + 配额）、`POST /api/users/{username}/{disable|enable|reset-password}`（**无 DELETE**）；`POST /api/auth/password`；`GET|POST /api/auth/activate`；`GET /api/audit`。
 - 凭证运维：`GET|POST /api/credentials`（列表 / 新增；列表每条附 `checkin_today` = 今日（北京时间）最近一条签到结果，供组头汇总）+ `DELETE /api/credentials/{id}`；动作端点 `checkin`（GET 查状态 / POST 执行）、`toggle`、`revive`、`refresh`（强制 RT 换新，成功先落库轮转后的 RT 再解禁用/冷却）、`probe`、`activity`、`pin`、`accounts/select`、`export`（单条 JSON 导出）；`PUT /api/credentials/{id}/limits|tags`、`GET|POST /api/credentials/{id}/growth`、`GET /api/credentials/{id}/credit-events|checkin-events|accounts`。
 - 模型：`GET /api/model-catalog`、`GET /api/models/availability`、`POST /api/models/probes/{probe,manual}`（`manual=on|off` 人工接管，优先于自动探活）。
-- 批量：`POST /api/credentials/batch`（`probe|toggle|checkin|revive|refresh`）。逐条隔离，响应 `{total, succeeded, failed, results[]}`；`toggle`/`revive`/`refresh` 落一条汇总审计。
-- 批量删除渠道：`DELETE /api/credentials/provider/{provider}`（专用端点，不复用通用批量 `delete`）。一次清空该渠道全部账号，响应 `{provider, deleted}`；未知渠道 400，空渠道 `deleted: 0`；前端渠道组头二次确认，落一条汇总审计。
+- 批量：`POST /api/credentials/batch`（`probe|toggle|checkin|revive|refresh|delete`）。逐条隔离，响应 `{total, succeeded, failed, results[]}`；`toggle`/`revive`/`refresh`/`delete` 落一条汇总审计。`delete` 由前端勾选后二次确认，确认时冻结 id 快照。
+- 批量删除渠道：`DELETE /api/credentials/provider/{provider}`（渠道级专用端点，与按 id 的勾选删除互补）。一次清空该渠道全部账号，响应 `{provider, deleted}`；未知渠道 400，空渠道 `deleted: 0`；前端渠道组头二次确认，落一条汇总审计。
 - 批量导入：`POST /api/credentials/batch-import`（`items[]`，≤100 条）。逐条校验，响应 `{created[], skipped[], failed[]}` 均带 `index`；同渠道内容完全一致去重；逐条审计 + 入队探测。
 - 备份：`GET/POST /api/backups`、`GET/DELETE /api/backups/{name}`、`POST /api/backups/restore`（原始字节，≤512MB）。恢复用「校验 → 暂存 → 下次启动应用」而不是运行中换库；启动应用失败只留档、不阻断（`db/backup.apply_pending_restore`）。
 - 配置与任务：`GET|PUT /api/settings` + `GET /api/tasks` + `POST /api/tasks/{key}/run`。列表端点统一 `sort` + `order`；未知键回落默认。回调：`GET /authorize`。

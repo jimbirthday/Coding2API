@@ -60,6 +60,7 @@ describe("CredentialsPage 批量运维", () => {
     expect(screen.queryByTestId("select-cb1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("group-select-codebuddy")).not.toBeInTheDocument();
     expect(screen.queryByTestId("credentials-batch-bar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("batch-delete")).not.toBeInTheDocument();
   });
 
   it("勾选后出现操作条，提交批量探测带上选中 id 并汇报结果", async () => {
@@ -132,6 +133,49 @@ describe("CredentialsPage 批量运维", () => {
     expect(toast).toHaveTextContent("刷新令牌完成：成功 1 / 2，失败 1");
     expect(within(toast).getByTestId("batch-failure"))
       .toHaveTextContent("备用号：refresh_token 已失效，必须重新登录");
+  });
+
+  it("勾选删除需要二次确认：取消不发请求，确认后按 id 快照删除", async () => {
+    const spy = mockFetch({
+      "/api/credentials/batch": {
+        action: "delete", total: 2, succeeded: 2, failed: 0,
+        results: [{ id: "cb1", ok: true }, { id: "cb2", ok: true }],
+      },
+      "/api/credentials": listBody([
+        makeCredential({ id: "cb1", provider: "codebuddy", nickname: "主号" }),
+        makeCredential({ id: "cb2", provider: "codebuddy", nickname: "备用号" }),
+      ]),
+    });
+    renderPage(<CredentialsPage />, ADMIN);
+    await settle();
+    await expandCredentialGroups();
+    await userEvent.click(screen.getByTestId("select-cb1"));
+    await userEvent.click(screen.getByTestId("select-cb2"));
+
+    const deleteCalls = () => spy.mock.calls.filter(
+      ([url, init]) => String(url).endsWith("/api/credentials/batch")
+        && (init as RequestInit | undefined)?.method === "POST",
+    );
+    await userEvent.click(screen.getByTestId("batch-delete"));
+    expect(screen.getByTestId("batch-delete-confirm"))
+      .toHaveTextContent("确认删除 2 个");
+    expect(deleteCalls()).toHaveLength(0);
+
+    await userEvent.click(screen.getByTestId("batch-delete-cancel"));
+    expect(screen.queryByTestId("batch-delete-confirm")).not.toBeInTheDocument();
+    expect(deleteCalls()).toHaveLength(0);
+
+    await userEvent.click(screen.getByTestId("batch-delete"));
+    // 确认期间筛选变化不能让删除目标漂移：提交的仍是点击删除时的快照。
+    await userEvent.type(screen.getByTestId("credential-search"), "主号");
+    expect(screen.getByTestId("batch-selected-count")).toHaveTextContent("已选 1 个");
+    await userEvent.click(screen.getByTestId("batch-delete-confirm"));
+
+    const toast = await screen.findByTestId("credentials-batch-result");
+    expect(batchCall(spy)).toEqual({ action: "delete", ids: ["cb1", "cb2"] });
+    expect(toast).toHaveTextContent("已删除：成功 2 / 2");
+    await waitFor(() =>
+      expect(screen.queryByTestId("credentials-batch-bar")).not.toBeInTheDocument());
   });
 
   it("不支持 RT 刷新的渠道不显示行内入口", async () => {

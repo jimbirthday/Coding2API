@@ -61,8 +61,8 @@ ACCOUNT_SORT_KEYS = {
 # 批量端点支持的动作。刻意只收「已有单条端点」的动作：
 # - `refresh` 有单条 `POST /api/credentials/{id}/refresh`，与预刷新任务共用
 #   `RefreshTask`（编辑锁 + 快照去重），因此批量强刷不会重复消费一次性 RT；
-# - `delete` 破坏性太强，需要单独的二次确认流，不走通用批量通道。
-BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive", "refresh"})
+# - `delete` 复用单条删除语义，前端勾选后仍要二次确认；逐条删除互不牵连。
+BATCH_ACTIONS = frozenset({"probe", "toggle", "checkin", "revive", "refresh", "delete"})
 
 # 单次批量的上限：一次点「全部探测」最多打多少个上游。上限存在的原因是
 # 探测/签到/刷新都会真的出网，没有上限时前端一个「全选」就能把整池凭证的请求
@@ -93,13 +93,14 @@ WEIGHT_MAX = 1000
 BATCH_CONCURRENCY = 4
 
 # 批量动作 → 审计动作。探测 / 签到是只读语义（与单条端点一致，不写审计），
-# 只有真正改动凭证状态的 toggle / revive / refresh 落一条汇总流水。
+# 只有真正改动凭证状态的 toggle / revive / refresh / delete 落一条汇总流水。
 # 写入本身有兜底：审计落库失败只记 warning，不让整批操作返回 500
 # （逐条结果比留痕更重要，且变更此时已提交生效）。
 BATCH_AUDIT_ACTIONS = {
     "toggle": ACTION_CREDENTIAL_TOGGLE,
     "revive": ACTION_CREDENTIAL_REVIVE,
     "refresh": ACTION_CREDENTIAL_REFRESH,
+    "delete": ACTION_CREDENTIAL_DELETE,
 }
 
 
@@ -689,11 +690,11 @@ def create_router(services: Services) -> APIRouter:
     async def delete_provider_credentials(provider_id: str,
                                           _csrf: None = Depends(csrf_protected),
                                           principal=Depends(principal_from_request)):
-        """删除某渠道的全部账号（渠道级批量删除）。
+        """删除某渠道的全部账号（渠道级清空）。
 
-        刻意不复用 `POST /api/credentials/batch` 的 `delete` 动作：删除是唯一
-        不可撤销的批量操作，需要独立的二次确认流。这里仍要求 operator + CSRF，
-        并落一条 `credential.delete` 汇总审计。
+        与通用批量 `delete`（勾选若干条）区分：本端点面向整个渠道，不读勾选，
+        一次事务删除该渠道全部账号。两种删除都不可撤销、都需要前端二次确认；
+        这里仍要求 operator + CSRF，并落一条 `credential.delete` 汇总审计。
 
         渠道 id 必须在 registry 里：拼错渠道名时返回 400，而不是静默回
         `deleted: 0`——否则管理员会以为「已清空」，实际只是写错了渠道。
@@ -821,8 +822,12 @@ def create_router(services: Services) -> APIRouter:
                     if not credentials.revive(credential_id, force=force_revive):
                         return {"id": credential_id, "ok": False, "error": "credential not found"}
                     return {"id": credential_id, "ok": True}
+                if action == "delete":
+                    if not credentials.delete(credential_id):
+                        return {"id": credential_id, "ok": False, "error": "credential not found"}
+                    return {"id": credential_id, "ok": True}
                 # probe / checkin / refresh 会真的出网：在途上限约束这三类动作。
-                # toggle / revive 是本地 DB 写，无上游压力，不受信号量限制。
+                # toggle / revive / delete 是本地 DB 写，无上游压力，不受信号量限制。
                 async with semaphore:
                     if action == "probe":
                         provider, data = provider_for(credential_id)

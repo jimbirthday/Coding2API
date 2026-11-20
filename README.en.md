@@ -479,18 +479,18 @@ No `credential_id` / `api_key_id` / `username` (high cardinality). `requests_tot
 
 ## Credential batch operations
 
-The credentials page offers multi-select plus batch bar (probe / check-in / RT refresh / pause / unpause / revive).
+The credentials page offers multi-select plus batch bar (probe / check-in / RT refresh / pause / unpause / revive / delete selected).
 
-- **Endpoint**: `POST /api/credentials/batch`, body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh", ids: [...], enabled?}`. Up to 200 ids, duplicates deduped.
+- **Endpoint**: `POST /api/credentials/batch`, body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh"|"delete", ids: [...], enabled?}`. Up to 200 ids, duplicates deduped.
 - **Manual RT refresh**: `POST /api/credentials/{id}/refresh` ignores the pre-refresh window and immediately exchanges the refresh_token for a new access token. On success it persists the rotated RT first, then clears the hard-disable / local cooldown and queues a quota probe. The response is `{ok, refreshed, rotated, expires_at, revived, reason?, error?}`; a terminal upstream rejection is `ok=false, error="relogin_required"` (HTTP 200, not 500). Batch `refresh` isolates rows and calls the same implementation, probing each successful row afterwards; both paths write `credential.refresh` audit entries (one summary row for a batch). Row and batch entries only appear for channels with refresh support, while a manually imported token without an RT fails per row with `credential has no refresh_token`.
 - **Batch import**: `POST /api/credentials/batch-import`, body `{items: [{provider, credential, nickname?, tags?}]}`. Up to 100 items; validated one by one, bad entries only land in `failed` (with `index` and reason); identical decrypted content within one channel counts as duplicate → `skipped`. The credentials page's *Batch import* accepts a JSON array / JSONL or a file.
 - **Per-item isolation**: one failure never blocks the rest. Response `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`.
+- **Selected delete**: `action="delete"` removes the submitted ids one by one. In the console, *Delete selected* enters a second confirmation and freezes the id snapshot at click time; no request is sent before confirmation, and later filter or selection changes do not alter the targets. Missing ids fail per row with `credential not found` without blocking the rest, and the batch writes one summary `credential.delete` audit row.
 - **A failed check-in is a result, not a failure**: an upstream refusal (account disabled / session expired / rate limited) returns `ok=false` with a readable `message`, never 500 — otherwise the console only says "check-in failed" and hides the real reason.
 - **Pause is explicit state, not toggle-flip**: `enabled` comes from body → bar has separate *Pause* / *Unpause* buttons.
 - **Revive ≠ unpause**: revive clears system hard-disable (needs re-login first); unpause sets `toggle enabled=true`.
-- **Clear a channel**: `DELETE /api/credentials/provider/{provider}` removes every credential of that channel and returns `{provider, deleted}`; unknown channels are 400, an already-empty channel returns `deleted: 0`. It is a dedicated endpoint rather than a generic batch `delete`: the action is irreversible, the console requires a separate confirmation on the channel header, and one summary `credential.delete` audit row is written.
-- Only actions with existing single-item endpoints: `delete` is excluded.
-- **Audit writes one summary row** (`toggle` / `revive` / `refresh`); audit failure logs warning and does not fail operation.
+- **Clear a channel**: `DELETE /api/credentials/provider/{provider}` removes every credential of that channel in one transaction and returns `{provider, deleted}`; unknown channels are 400, an already-empty channel returns `deleted: 0`. It targets the whole channel instead of selected ids and complements *Delete selected*; both are irreversible, both require console confirmation, and both write one summary `credential.delete` audit row.
+- **Audit writes one summary row** (`toggle` / `revive` / `refresh` / `delete`); audit failure logs warning and does not fail operation.
 
 ## Credential limit guards
 

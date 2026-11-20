@@ -229,6 +229,11 @@ const BATCH_BUTTONS: readonly BatchButton[] = [
   { key: "revive", action: "revive", verb: "恢复", done: "已恢复" },
 ];
 
+/** 勾选删除单独渲染：破坏性操作先进入确认态，不能跟普通批量按钮一样点即执行。 */
+const BATCH_DELETE: BatchButton = {
+  key: "delete", action: "delete", verb: "删除选中", done: "已删除",
+};
+
 /**
  * 批量结果浮层：成功数 + 失败明细。
  *
@@ -400,6 +405,8 @@ export function CredentialsPage() {
   const client = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // 勾选删除的 id 快照：确认期间筛选或勾选变化不应改变真正要删的账号。
+  const [confirmBatchDelete, setConfirmBatchDelete] = useState<string[] | null>(null);
   // 渠道级二次确认：删除整个渠道不可撤销，先进入确认态，再发请求。
   const [confirmClearProvider, setConfirmClearProvider] = useState<string | null>(null);
   // 添加凭证对话框（登录渠道 / JSON 导入 / 免费层补回都收在里面）
@@ -504,6 +511,11 @@ export function CredentialsPage() {
     () => filtered.filter((credential) => selected.has(credential.id)),
     [filtered, selected],
   );
+  // 勾选被清空 / 筛选后无可见选中项时，一并退出删除确认，避免下次勾选时
+  // 突然复用旧的 id 快照。
+  useEffect(() => {
+    if (selectedIds.length === 0) setConfirmBatchDelete(null);
+  }, [selectedIds.length]);
   // 批量结果里要把 id 换成人能认出的昵称
   const credentialNames = useMemo(
     () => new Map(credentials.map((item) => [item.id, item.nickname || item.id.slice(0, 12)])),
@@ -615,8 +627,8 @@ export function CredentialsPage() {
    * 同一批号再点一次「签到」没有意义；失败项也一并清空，避免用户以为要重试
    * 却把成功项又跑一遍（失败原因通常需要先修凭证）。
    */
-  const runBatch = async (button: BatchButton) => {
-    const ids = selectedIds.map((credential) => credential.id);
+  const runBatch = async (button: BatchButton, idSnapshot?: string[]) => {
+    const ids = idSnapshot ?? selectedIds.map((credential) => credential.id);
     if (ids.length === 0) return;
     setBusy(true);
     try {
@@ -633,6 +645,7 @@ export function CredentialsPage() {
       showError(caught instanceof Error ? caught.message : "批量操作失败");
     } finally {
       setBusy(false);
+      setConfirmBatchDelete(null);
     }
   };
 
@@ -1083,27 +1096,65 @@ export function CredentialsPage() {
                 <span className="text-xs text-muted-foreground" data-testid="batch-selected-count">
                   已选 <strong className="tabular-nums text-foreground">{selectedIds.length}</strong> 个
                 </span>
-                {BATCH_BUTTONS.map((button) => (
-                  <Button
-                    key={button.key}
-                    size="sm"
-                    variant="default"
-                    disabled={busy}
-                    data-testid={`batch-${button.key}`}
-                    onClick={() => void runBatch(button)}
-                  >
-                    {button.verb}
-                  </Button>
-                ))}
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy}
-                  data-testid="batch-clear"
-                  onClick={() => setSelected(new Set())}
-                >
-                  取消选择
-                </Button>
+                {confirmBatchDelete ? (
+                  <>
+                    <span className="text-xs text-danger-ink">
+                      确认删除 <strong className="tabular-nums">{confirmBatchDelete.length}</strong> 个账号？此操作不可撤销。
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      disabled={busy}
+                      data-testid="batch-delete-confirm"
+                      onClick={() => void runBatch(BATCH_DELETE, confirmBatchDelete)}
+                    >
+                      确认删除 {confirmBatchDelete.length} 个
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      data-testid="batch-delete-cancel"
+                      onClick={() => setConfirmBatchDelete(null)}
+                    >
+                      取消
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    {BATCH_BUTTONS.map((button) => (
+                      <Button
+                        key={button.key}
+                        size="sm"
+                        variant="default"
+                        disabled={busy}
+                        data-testid={`batch-${button.key}`}
+                        onClick={() => void runBatch(button)}
+                      >
+                        {button.verb}
+                      </Button>
+                    ))}
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      disabled={busy}
+                      data-testid="batch-delete"
+                      onClick={() => setConfirmBatchDelete(
+                        selectedIds.map((credential) => credential.id))}
+                    >
+                      <Trash2 className="size-3.5" /> 删除选中
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      data-testid="batch-clear"
+                      onClick={() => setSelected(new Set())}
+                    >
+                      取消选择
+                    </Button>
+                  </>
+                )}
               </div>
             )}
 

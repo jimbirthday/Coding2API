@@ -668,7 +668,7 @@ export interface CheckinResult {
 }
 
 /** 批量动作：与后端 `BATCH_ACTIONS` 同口径（只收已有单条端点的动作）。 */
-export type BatchAction = "probe" | "toggle" | "checkin" | "revive" | "refresh";
+export type BatchAction = "probe" | "toggle" | "checkin" | "revive" | "refresh" | "delete";
 
 /**
  * 手动 RT 刷新结果。

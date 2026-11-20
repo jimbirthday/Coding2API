@@ -257,6 +257,59 @@ def test_batch_revive_force_clears_upstream_cooldown(batch_app):
     assert rows[credential_id]["cooling_until"] is None
 
 
+def test_batch_delete_removes_selected_and_audits(batch_app):
+    """勾选删除只删提交的 id，保留其他渠道，并落一条汇总审计。"""
+    app, client = batch_app
+    first = _add(app)
+    second = _add(app)
+    other = _add(app, "trae")
+
+    response = client.post("/api/credentials/batch",
+                           json={"action": "delete", "ids": [first, second]})
+    assert response.status_code == 200
+    assert response.json() == {
+        "action": "delete", "total": 2, "succeeded": 2, "failed": 0,
+        "results": [{"id": first, "ok": True}, {"id": second, "ok": True}],
+    }
+    rows = {row["id"]: row for row in app.state.credentials.list_all()}
+    assert first not in rows and second not in rows
+    assert rows[other]["provider"] == "trae"
+    events = app.state.audit.query(action="credential.delete")
+    assert len(events) == 1
+    assert events[0]["target"] is None
+    assert events[0]["detail"] == "批量 delete：2/2 成功"
+
+
+def test_batch_delete_isolates_missing_credential(batch_app):
+    """一条已不存在不影响其余条；审计按真实成功率记录。"""
+    app, client = batch_app
+    credential_id = _add(app)
+
+    body = client.post("/api/credentials/batch",
+                       json={"action": "delete",
+                             "ids": [credential_id, "cred_ghost"]}).json()
+    assert body["succeeded"] == 1 and body["failed"] == 1
+    by_id = {row["id"]: row for row in body["results"]}
+    assert by_id[credential_id] == {"id": credential_id, "ok": True}
+    assert by_id["cred_ghost"] == {"id": "cred_ghost", "ok": False,
+                                   "error": "credential not found"}
+    assert credential_id not in {row["id"] for row in app.state.credentials.list_all()}
+    events = app.state.audit.query(action="credential.delete")
+    assert len(events) == 1 and events[0]["detail"] == "批量 delete：1/2 成功"
+
+
+def test_batch_delete_rejects_csrf(batch_app):
+    app, client = batch_app
+    credential_id = _add(app)
+    response = client.post(
+        "/api/credentials/batch",
+        json={"action": "delete", "ids": [credential_id]},
+        headers={"Origin": "http://evil.example.com"},
+    )
+    assert response.status_code == 403
+    assert credential_id in {row["id"] for row in app.state.credentials.list_all()}
+
+
 def test_batch_toggle_resume_writes_enabled_direction(batch_app):
     """批量「取消暂停」（enabled=true）与「暂停」是同一动作，靠审计方向区分。
 
@@ -436,6 +489,9 @@ def test_batch_rejects_viewer(tmp_path):
         client.post("/api/auth/login", json={"username": "guest", "password": "guestpw"})
         response = client.post("/api/credentials/batch",
                                json={"action": "probe", "ids": ["cred_1"]})
+        assert response.status_code == 403
+        response = client.post("/api/credentials/batch",
+                               json={"action": "delete", "ids": ["cred_1"]})
         assert response.status_code == 403
         assert client.delete(
             "/api/credentials/provider/codebuddy").status_code == 403

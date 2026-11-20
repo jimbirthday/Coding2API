@@ -488,20 +488,20 @@ export GOOGLE_GENAI_BASE_URL=http://127.0.0.1:8000   # SDK 会自拼 /v1beta
 
 ## 凭证批量运维
 
-凭证页支持多选 + 批量操作条（探测额度 / 每日签到 / RT 刷新 / 暂停 / 取消暂停 / 恢复）。
+凭证页支持多选 + 批量操作条（探测额度 / 每日签到 / RT 刷新 / 暂停 / 取消暂停 / 恢复 / 删除选中）。
 
-- **端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh", ids: [...], enabled?, force?}`。一次 ≤200 条，重复 id 去重。`force` 只对 `revive` 有效（见下）。
+- **端点**：`POST /api/credentials/batch`，body `{action: "probe"|"toggle"|"checkin"|"revive"|"refresh"|"delete", ids: [...], enabled?, force?}`。一次 ≤200 条，重复 id 去重。`force` 只对 `revive` 有效（见下）。
 - **手动 RT 刷新**：`POST /api/credentials/{id}/refresh` 无视预刷新窗口，立即用 refresh_token 换新 access token；成功后先落库轮转后的 RT，再解除硬禁用 / 本地冷却并排队重探额度。响应 `{ok, refreshed, rotated, expires_at, revived, reason?, error?}`，上游明确判票作废时是 `ok=false, error="relogin_required"`（HTTP 200，不是 500）。批量 `refresh` 逐条隔离并调用同一实现，成功后同样重探额度；两条入口都会写 `credential.refresh` 审计（批量只写一条汇总）。行内与批量入口仅对有刷新能力的渠道显示，手工 token 没有 RT 时逐条返回 `credential has no refresh_token`。
 - **批量导入**：`POST /api/credentials/batch-import`，body `{items: [{provider, credential, nickname?, tags?}]}`。一次 ≤100 条；逐条校验，坏条目只进 `failed`（带 `index` 与原因）；同渠道解密后内容完全一致视为重复，进 `skipped`。管理台凭证页「批量导入」支持粘贴 JSON 数组 / JSONL 或选文件。
 - **单条导出**：`GET /api/credentials/{id}/export` 返回与批量导入**同形**的 JSON（`provider` / `credential` / `nickname` / `tags`），可原样再导入。响应带 `Content-Disposition` 附件头与 `no-store`，内容是**明文凭证**——只对 admin/operator 开放，且落 `credential.export` 审计。管理台入口：凭证行「更多操作 → 导出凭证」。
 - **逐条隔离**：单条失败不影响其余。响应 `{action, total, succeeded, failed, results: [{id, ok, error?, detail?}]}`。
+- **勾选删除**：`action="delete"` 按提交的 id 逐条删除。管理台点「删除选中」先进入二次确认并冻结当时的 id 快照，确认前不发请求；确认期间筛选或勾选变化不会改变删除目标。已不存在的 id 逐条返回 `credential not found`，不影响其余条；整批落一条 `credential.delete` 汇总审计。
 - **签到失败是结果不是故障**：上游拒绝（账号被禁用 / 登录过期 / 限流）回 `ok=false` + 可读 `message`，不 500——否则管理台只弹「签到失败」，看不出真实原因。
 - **暂停是显式状态而非取反**：`toggle` 的 `enabled` 由请求体给出 → 操作条拆「暂停」/「取消暂停」两按钮。
 - **「恢复」≠「取消暂停」**：前者 `revive`（解系统硬禁用，需先重新登录）；后者 `toggle enabled=true`。
 - **「恢复」默认保留上游点名的冷却**：`revive` 只解硬禁用、清本地冷却与模型级条目；冷却来源属于「上游点名恢复时刻」（限流 / 余额 / 权益 / 风控，即 `cooling_kind` ∈ `UPSTREAM_COOLDOWN_KINDS`）时**保留**——清掉只会立刻再撞一次上游（实测 2026-11-03 12:22–12:23 三次恢复 zen 凭证，每次都在恢复时顺手解掉刚写入的 429 冷却，下一请求再撞同一个 429）。要强制清除走 `force=true`（单条端点请求体 / 批量 `force`，前端菜单项「强制恢复」）。
-- **清空渠道**：`DELETE /api/credentials/provider/{provider}` 一次删除该渠道全部账号，返回 `{provider, deleted}`；未知渠道 400，渠道本来为空返回 `deleted: 0`。这是专用端点而非通用批量的 `delete` 动作——不可撤销，管理台在渠道组头单独做二次确认，并落一条 `credential.delete` 汇总审计。
-- 只收已有单条端点的动作：`delete` 不走此通道。
-- **审计只记一条汇总**（`toggle` / `revive` / `refresh`）。审计写失败只记 warning，不影响操作结果。
+- **清空渠道**：`DELETE /api/credentials/provider/{provider}` 一次事务删除该渠道全部账号，返回 `{provider, deleted}`；未知渠道 400，渠道本来为空返回 `deleted: 0`。它面向整个渠道而不读勾选，与按 id 的「勾选删除」互补；两者都不可撤销、管理台都需二次确认，并落一条 `credential.delete` 汇总审计。
+- **审计只记一条汇总**（`toggle` / `revive` / `refresh` / `delete`）。审计写失败只记 warning，不影响操作结果。
 
 ## 凭证限额护栏
 
